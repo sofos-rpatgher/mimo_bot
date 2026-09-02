@@ -1,0 +1,22 @@
+# Dependencies are installed fresh inside the image
+node_modules
+
+# Secrets / host-specific config — provide at runtime (env or bind mount)
+config.json
+
+# RPA run artifacts produced on the host
+trace.zip
+diag_failure.png
+*.png
+*.log
+
+# VCS / editor / OS noise
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+
+# Docker files themselves
+Dockerfile
+.dockerignore

@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Secrets / host-specific config — commit config.example.json instead.
+# Contains the SAP credentials and the /poll bearer token.
+config.json
+
+# RPA run artifacts (Playwright traces, failure screenshots, logs)
+trace.zip
+*.zip
+diag_failure.png
+*.png
+*.log
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+playwright/.cache/
+
+# Playwright browser downloads, if ever installed in-tree
+ms-playwright/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.*
+!.env.example
