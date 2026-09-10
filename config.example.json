@@ -10,6 +10,7 @@
 
   "serverOrigin": "https://your-sap-host:44302",
   "sapClient": 300,
+  "sapLanguage": "EN",
   "username": "SAP_USER",
   "password": "SAP_PASSWORD",
   "headless": true,

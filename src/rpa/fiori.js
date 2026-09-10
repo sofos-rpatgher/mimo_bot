@@ -6,10 +6,13 @@
 // ============================================================
 import { chromium } from '@playwright/test';
 
-// Reconstruye una URL completa forzando el origin + sap-client del entorno destino.
+// Reconstruye una URL completa forzando el origin + sap-client + sap-language del entorno destino.
 // Acepta URL relativa (formato plataforma) o absoluta (grabación raw): descarta cualquier
 // host grabado y conserva path + hash + demás parámetros de query.
-function buildResolveUrl(serverOrigin, sapClient, baseLink) {
+// sap-language se SOBREESCRIBE siempre (no se respeta el de la grabación): SAP le da prioridad
+// sobre el Accept-Language del navegador, así que un `sap-language=ES` colado en un APP_LINK
+// grabado dejaría la sesión en español y rompería los selectores por texto (todos en inglés).
+function buildResolveUrl(serverOrigin, sapClient, baseLink, sapLanguage) {
     return function resolveUrl(stored) {
         if (!stored) return baseLink;
         let u;
@@ -19,6 +22,7 @@ function buildResolveUrl(serverOrigin, sapClient, baseLink) {
         target.search = u.search;
         target.hash = u.hash;
         if (sapClient) target.searchParams.set('sap-client', sapClient);
+        if (sapLanguage) target.searchParams.set('sap-language', sapLanguage);
         return target.toString();
     };
 }
@@ -311,14 +315,23 @@ async function _execute(script, options) {
     // condicionalmente) usan este timeout corto y, si el elemento no aparece, se OMITEN sin fallar
     // el intent. Un paso normal ausente sigue fallando con el timeout largo (60 s).
     const optionalTimeoutMs = options.optionalTimeoutMs || 8000;
-    // Idioma del navegador (Accept-Language). SAP sirve la página de login y la sesión en este
-    // idioma. DEBE ser inglés: SAPLogin detecta campos "User"/"Password" y los selectores por
-    // texto (p.ej. "Local Object", "Save") están grabados en inglés. En headless Chromium no
-    // hereda el locale del SO (se iría a español por defecto del sistema SofOS) → login falla.
+    // --- Idioma de la sesión: DEBE ser inglés -------------------------------------------------
+    // No es una preferencia: SAPLogin detecta los campos por texto ("User"/"Password"/"Log On") y
+    // los selectores de los pasos están grabados en inglés ("Local Object", "Save", headers de
+    // tabla…). Con la sesión en otro idioma, el login o el matching por texto se caen.
+    // Se fija por DOS vías, porque cubren cosas distintas:
+    //   1. sap-language (URL): es lo que SAP realmente honra, y gana sobre el Accept-Language.
+    //      Se inyecta en BASE_LINK y en toda URL que pase por resolveUrl.
+    //   2. locale (Accept-Language del contexto): red de seguridad para lo que no pasa por
+    //      resolveUrl (redirects y ventanas que abre el propio SAP). En headless Chromium no
+    //      hereda el locale del SO (se iría a español por defecto del sistema SofOS).
+    // Ambos son configurables desde config.json por si algún día hace falta otro idioma, pero
+    // deben moverse JUNTOS y las grabaciones tendrían que rehacerse en ese idioma.
+    const sapLanguage  = String(options.sapLanguage || process.env.SAP_LANGUAGE || 'EN').toUpperCase();
     const locale       = options.locale || 'en-US';
 
-    const BASE_LINK = `${serverOrigin}/sap/bc/ui2/flp?sap-client=${sapClient}`;
-    const resolveUrl = buildResolveUrl(serverOrigin, sapClient, BASE_LINK);
+    const BASE_LINK = `${serverOrigin}/sap/bc/ui2/flp?sap-client=${sapClient}&sap-language=${sapLanguage}`;
+    const resolveUrl = buildResolveUrl(serverOrigin, sapClient, BASE_LINK, sapLanguage);
 
     const result = { success: false, intentsTotal: 0, intentsCompleted: 0, completedInstanceIids: [], failure: null, durationMs: 0 };
     const startedAt = Date.now();
