@@ -302,8 +302,15 @@ export async function runFiori(script, options = {}) {
 
 async function _execute(script, options) {
     // --- Configuración desde options (el servidor las toma de su config.json) ---
-    const serverOrigin = options.serverOrigin || process.env.SAP_SERVER || 'https://web01.sofos.proatech.mx:44302';
-    const sapClient    = options.sapClient   || process.env.SAP_CLIENT  || '300';
+    // El destino SAP NO lleva valor por defecto a propósito: con un default, una configuración
+    // incompleta no falla — manda el robot a ejecutar acciones REALES contra otro SAP, en silencio.
+    // Que falte `serverOrigin` tiene que ser un error ruidoso (se comprueba abajo, antes de abrir
+    // el navegador). Mismo criterio para `sapClient`: el cliente también decide a qué datos se escribe.
+    const serverOrigin = options.serverOrigin || process.env.SAP_SERVER || null;
+    const sapClient    = options.sapClient   || process.env.SAP_CLIENT  || null;
+    // Sistema declarado por la configuración de ESTE bot (etiqueta lógica, p.ej. 'SOFOS_DEMO').
+    // Se registra en el resultado del job; el contraste con el sistema del lote lo hace el worker.
+    const sapSystem    = options.sap_system  || options.sapSystem || process.env.SAP_SYSTEM || null;
     const username     = options.username    || process.env.SAP_USER;
     const password     = options.password    || process.env.SAP_PASS;
     const headless     = options.headless  !== undefined ? options.headless  : true;
@@ -333,9 +340,17 @@ async function _execute(script, options) {
     const BASE_LINK = `${serverOrigin}/sap/bc/ui2/flp?sap-client=${sapClient}&sap-language=${sapLanguage}`;
     const resolveUrl = buildResolveUrl(serverOrigin, sapClient, BASE_LINK, sapLanguage);
 
-    const result = { success: false, intentsTotal: 0, intentsCompleted: 0, completedInstanceIids: [], failure: null, durationMs: 0 };
+    // `target` deja por escrito en el resultado del job (y por tanto en MIMO, vía notify) contra qué
+    // servidor, cliente, sistema y usuario se ejecutó realmente. El sistema que declara el lote es
+    // sólo una intención; esto es el destino de verdad.
+    const result = { success: false, intentsTotal: 0, intentsCompleted: 0, completedInstanceIids: [], failure: null, durationMs: 0,
+                     target: { system: sapSystem, serverOrigin, sapClient, sapLanguage, username: username || null } };
     const startedAt = Date.now();
     let current = null; // contexto del paso en curso (para localizar el fallo)
+    // Fase gruesa de la ejecución. `current` localiza el PASO; `phase` cubre lo que pasa fuera de un
+    // paso (login, arranque del launchpad, navegación), que es justo donde murió FORMS-0000001 y donde
+    // el mensaje que llegaba a MIMO ('Timeout 30000ms exceeded') no decía nada del destino.
+    let phase = 'startup';
 
     // --- Telemetría de progreso para la consola en vivo de MIMO (contrato onProgress) ---
     // El worker pasa options.onProgress y recoge los eventos (él asigna seq/at, buffea y hace flush).
@@ -352,8 +367,20 @@ async function _execute(script, options) {
         intent: current.intent,
     } : {});
 
+    // --- Guardias de destino: antes que nada, saber CONTRA QUÉ se va a ejecutar ------------------
+    // Sin esto, una clave ausente no detiene la corrida: la manda a otro SAP sin avisar.
+    const missing = [];
+    if (!serverOrigin) missing.push('serverOrigin (o SAP_SERVER)');
+    if (!sapClient)    missing.push('sapClient (o SAP_CLIENT)');
+    if (missing.length) {
+        result.failure = { phase: 'config', message: `Configuración de destino SAP incompleta: falta ${missing.join(', ')} en config.json/options. Se aborta el job: no hay destino por defecto.` };
+        console.error(`❌ ${result.failure.message}`);
+        result.durationMs = Date.now() - startedAt;
+        return result;
+    }
+
     if (!username || !password) {
-        result.failure = { message: 'Faltan credenciales (username/password) en options o env (SAP_USER/SAP_PASS).' };
+        result.failure = { phase: 'config', message: `Faltan credenciales (username/password) en options o env (SAP_USER/SAP_PASS). Destino: ${serverOrigin} (client ${sapClient}).` };
         result.durationMs = Date.now() - startedAt;
         return result;
     }
@@ -430,16 +457,35 @@ async function _execute(script, options) {
         // Toda la navegación a apps la realiza el bucle de intents (cada intent con su propio path).
         console.log("🔐 0. Ejecutando SAP Login →", BASE_LINK);
         emit({ level: 'INFO', done: 0, total: totalSteps, message: `Logging in to SAP (${username})…` });
+        phase = `login SAP (${username} @ ${BASE_LINK})`;
         await page.SAPLogin(username, password, BASE_LINK);
 
-        console.log("⏳ Esperando a que la página se estabilice después del login...");
-        await page.waitForLoadState('networkidle');
+        // Esta espera es TAMBIÉN la verificación del login: SAPLogin no comprueba que haya funcionado
+        // (tras el clic en Log On hace waitForNavigation/waitForLoadState dentro de un try/catch vacío,
+        // así que retorna igual si el servidor rechazó la contraseña). Que SAPUI5 arranque sí prueba
+        // que la sesión quedó establecida y el shell vivo.
+        //
+        // Antes aquí había `waitForLoadState('networkidle')`, sin timeout propio ni catch: abortaba el
+        // job entero. Un launchpad Fiori real NUNCA da los ~500 ms de silencio de red que networkidle
+        // exige — en el lote FORMS-0000001 fueron 491 peticiones (281 fragmentos UI5, un tile de Smart
+        // Business cada uno) más el sondeo del servicio de notificaciones, y en el trace no hay una sola
+        // ventana de 500 ms de silencio ni a los ~78 s. Subir el timeout sólo convierte un fallo rápido
+        // en uno lento; Playwright marca `networkidle` como DISCOURAGED exactamente por esto y
+        // recomienda esperar una señal renderizada. Mismo criterio que la espera de arriveAtApp.
+        console.log("⏳ Esperando a que SAPUI5 arranque en el launchpad (señal de que el login aterrizó)...");
+        phase = `arranque del launchpad tras el login (${BASE_LINK})`;
+        await page.waitForFunction(() => !!(window.sap && sap.ui && (
+            typeof sap.ui.getCore === 'function' ? sap.ui.getCore() : (sap.ui.core && sap.ui.core.Element)
+        )), { timeout: 120000 });
+        console.log("✅ Launchpad vivo: SAPUI5 cargado — la sesión SAP quedó establecida.");
+        emit({ level: 'INFO', done: 0, total: totalSteps, message: `Launchpad ready at ${serverOrigin} (client ${sapClient}, user ${username}).` });
 
         // 🔁 Recorrer la jerarquía con logs por nivel: block → instruction → instance → intent.
         // ── Helpers reutilizables (intents normales Y aggregated_intents) ──────────────
         // arriveAtApp: navega a la app (con la lógica WEBGUI/same-app), detecta el entorno
         // y engancha el force-same-tab. runStepList: ejecuta una lista de pasos SIN navegar.
         async function arriveAtApp(appLink, steps) {
+                phase = `navegación a la app (${appLink})`;
                 console.log("  ┃  ┃  ┃  🚀 Navegando →", appLink);
                 emit({ level: 'INFO', done: stepsDone, total: totalSteps, ...ctx(), message: `Navigating → ${appLink}` });
                 // Si la app ACTUAL es WEBGUI (corre en un iframe), un page.goto que sólo cambia el
@@ -460,7 +506,10 @@ async function _execute(script, options) {
                         // cambio NO se guarda. Señales: sin overlay .lsBlockLayer + red inactiva.
                         await page.waitForTimeout(1500);
                         await page.waitForFunction(() => { const f = document.querySelector('iframe[id^="application-"]'); try { return !f || !f.contentDocument || !f.contentDocument.querySelector('.lsBlockLayer'); } catch (e) { return true; } }, { timeout: 10000 }).catch(() => {});
-                        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+                        // networkidle no se cumple nunca en este launchpad (tiles + sondeo de
+                        // notificaciones): trae catch, así que no rompe, pero se agota siempre. La señal
+                        // buena es el .lsBlockLayer de arriba; esto queda sólo como margen corto.
+                        await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
                     }
                     console.log(`  ┃  ┃  ┃  🔁 transición con app WEBGUI (${_fromWebgui ? 'origen' : ''}${_fromWebgui && _toWebgui ? '+' : ''}${_toWebgui ? 'destino' : ''}) → recarga completa`);
                     await page.goto('about:blank').catch(() => {});
@@ -487,7 +536,11 @@ async function _execute(script, options) {
                         await page.goto('about:blank').catch(() => {});
                         await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
                     } else {
-                        await page.goto(appLink, { waitUntil: 'networkidle', timeout: 30000 });
+                        // `domcontentloaded`, igual que las otras dos ramas de arriveAtApp: el shell Fiori
+                        // mantiene la red viva, así que 'networkidle' aquí se agota siempre y aborta el
+                        // primer intent que navegue por este camino. La comprobación de verdad es el
+                        // waitForFunction de SAPUI5 que viene inmediatamente después.
+                        await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
                     }
                 }
 
@@ -498,6 +551,7 @@ async function _execute(script, options) {
             return !!(sap.ui.core && sap.ui.core.Element);
         }, { timeout: 30000 });
         console.log(T_ENV + "✅ Entorno Base SAPUI5 detectado. Iniciando ejecución híbrida...");
+        phase = `ejecución de pasos (${appLink})`;
 
         // 2. ⏳ Esperamos a que Fiori inyecte el iFrame de la aplicación (opcional — apps UI5 puras no lo usan)
         console.log(T_ENV + "⏳ Esperando a que el contenedor de la aplicación WebGUI cargue...");
@@ -1209,12 +1263,20 @@ if (step.technology === 'WEBGUI') {
         console.log("\n🏁 ¡Escenario completado con éxito!");
 
     } catch (error) {
+        // El mensaje que llega a MIMO tiene que nombrar el DESTINO, no sólo el síntoma: un
+        // 'Timeout 30000ms exceeded' a secas manda a revisar la red, y en FORMS-0000001 la red estaba
+        // sana (491 peticiones, todas 200). Se añaden fase, URL real de la página, usuario y servidor.
+        let pageUrl = null;
+        try { pageUrl = page.url(); } catch { /* la página pudo cerrarse */ }
+        const where = `fase=${phase} · url=${pageUrl || BASE_LINK} · user=${username} · server=${serverOrigin} client=${sapClient}${sapSystem ? ` system=${sapSystem}` : ''}`;
+        const detail = `${error.message} — ${where}`;
+
         // ERROR: emitir en el paso que falla, justo antes de poblar result.failure (misma info).
         emit({ level: 'ERROR', done: stepsDone, total: totalSteps, ...ctx(),
                step_no: current && current.stepIndex, action: current && current.action,
-               message: `❌ Error (intent=${current?.intent ?? '?'}, step=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${error.message}` });
-        result.failure = { ...(current || {}), message: error.message };
-        console.error(`\n❌ Error en la ejecución (intent=${current?.intent ?? '?'}, paso=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${error.message}`);
+               message: `❌ Error (intent=${current?.intent ?? '?'}, step=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${detail}` });
+        result.failure = { ...(current || {}), phase, url: pageUrl || BASE_LINK, username, serverOrigin, sapClient, system: sapSystem, message: detail };
+        console.error(`\n❌ Error en la ejecución (intent=${current?.intent ?? '?'}, paso=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${detail}`);
     } finally {
         // 🔓 Liberar el lock de SAP: si quedamos en modo edición, salir con "Cancel"
         // (o "Discard") antes de cerrar. De lo contrario SAP retiene el enqueue lock
@@ -1242,8 +1304,13 @@ if (step.technology === 'WEBGUI') {
 
         // Detener el trace (solo si debug)
         if (debug) {
-            console.log("💾 Guardando el archivo de trace (trace.zip)...");
-            await context.tracing.stop({ path: 'trace.zip' }).catch(() => {});
+            // Con el job_iid en el nombre: antes se sobrescribía en cada ejecución, y el trace es la
+            // única prueba de lo que pasó dentro del navegador (fue lo que demostró que el login de
+            // FORMS-0000001 sí había funcionado).
+            const safeIid = String(options.jobIid || '').replace(/[^\w.-]/g, '_');
+            const tracePath = safeIid ? `trace-${safeIid}.zip` : 'trace.zip';
+            console.log(`💾 Guardando el archivo de trace (${tracePath})...`);
+            await context.tracing.stop({ path: tracePath }).catch(() => {});
         }
         await browser.close().catch(() => {});
     }

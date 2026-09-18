@@ -9,6 +9,7 @@
   "csharp_port": 5000,
 
   "serverOrigin": "https://your-sap-host:44302",
+  "sap_system": "REQUIRED-name-of-the-SAP-system-this-serverOrigin-points-at",
   "sapClient": 300,
   "sapLanguage": "EN",
   "username": "SAP_USER",

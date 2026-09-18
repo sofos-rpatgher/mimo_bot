@@ -17,6 +17,39 @@ const GETNEXTJOB_URL = `${config.server_url}/scheduler/v1/getNextJob`;
 // One-job-at-a-time guard, shared across every trigger.
 let isRunning = false;
 
+// Etiqueta normalizada de un sistema SAP, para comparar sin depender de mayúsculas ni espacios.
+const normSystem = (v) => (v === null || v === undefined) ? '' : String(v).trim().toUpperCase();
+
+/**
+ * Comprueba que el sistema SAP que declara el lote sea el que este bot tiene configurado.
+ *
+ * Hasta ahora el sistema del lote era decorativo: todas las opciones de conexión salen del
+ * config.json local, y el job no transportaba el sistema — el lote FORMS-0000001 declaraba
+ * 'SOFOS_DEMO' y la corrida fue contra Grupo Mar sin que nada lo advirtiera. El modo de fallo,
+ * dicho claro: una acción real ejecutada en el SAP de otra empresa.
+ *
+ * En cuanto MIMO mande el sistema en el job, un job que no sea para este bot se rechaza ANTES de
+ * abrir el navegador. Mientras no lo mande, se avisa y se sigue (comportamiento de hoy).
+ *
+ * @returns {string|null} el motivo del rechazo, o null si el job puede ejecutarse.
+ */
+function checkJobSystem(job) {
+    const jobSystem = normSystem(job.sap_system ?? job.system_id ?? job.system);
+    const botSystem = normSystem(config.sap_system ?? config.system_id);
+
+    if (!jobSystem) {
+        console.warn(`[Worker] Job '${job.job_iid}' no declara sistema SAP — se ejecuta contra el destino del config.json (${config.serverOrigin}, client ${config.sapClient}).`);
+        return null;
+    }
+    if (!botSystem) {
+        return `El job declara el sistema SAP '${jobSystem}' pero este bot no tiene 'sap_system' en su config.json: no se puede verificar el destino. Define 'sap_system' con el sistema al que apunta ${config.serverOrigin}.`;
+    }
+    if (jobSystem !== botSystem) {
+        return `El job declara el sistema SAP '${jobSystem}' y este bot está configurado para '${botSystem}' (${config.serverOrigin}, client ${config.sapClient}). Se rechaza el job: ejecutarlo escribiría en el SAP equivocado.`;
+    }
+    return null;
+}
+
 /**
  * Asks the server for the next job to run.
  * @returns {Promise<object|null>} the job ({ job_iid, batch_iid, batch_id, rpa_type, script })
@@ -53,7 +86,16 @@ async function runJob(job) {
         return;
     }
 
-    console.log(`[Worker] Starting job '${job_iid}' (${rpa_type})…`);
+    // Destino antes que nada: un job para otro sistema no llega a abrir el navegador.
+    const systemMismatch = checkJobSystem(job);
+    if (systemMismatch) {
+        console.error(`[Worker] Job '${job_iid}' rechazado: ${systemMismatch}`);
+        await notify(job_iid, 'FAILED', '', systemMismatch,
+                     JSON.stringify({ success: false, failure: { phase: 'system-check', message: systemMismatch } }));
+        return;
+    }
+
+    console.log(`[Worker] Starting job '${job_iid}' (${rpa_type}) → ${config.serverOrigin} client ${config.sapClient}${config.sap_system ? ` [${config.sap_system}]` : ''}…`);
 
     // Live execution trace: the RPA engine calls progress.onProgress as it runs.
     const progress = createProgressReporter(job_iid);
@@ -61,7 +103,8 @@ async function runJob(job) {
     let result;
     try {
         if (rpa_type === 'fiori') {
-            result = await runFiori(parsed, { ...config, onProgress: progress.onProgress });
+            // jobIid: para que el trace.zip de esta corrida no pise el de la anterior.
+            result = await runFiori(parsed, { ...config, jobIid: job_iid, onProgress: progress.onProgress });
         } else {
             result = await runSapgui(job_iid, parsed, batch_iid);
         }
@@ -79,7 +122,7 @@ async function runJob(job) {
     const result_json = JSON.stringify(result);
 
     if (result.success) {
-        console.log(`[Worker] Job '${job_iid}' completed.`);
+        console.log(`[Worker] Job '${job_iid}' completed (target: ${JSON.stringify(result.target ?? null)}).`);
         await notify(job_iid, 'COMPLETED', '', '', result_json);
     } else {
         const msg = (result.failure && result.failure.message) || 'Unknown error';
