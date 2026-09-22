@@ -27,6 +27,62 @@ function buildResolveUrl(serverOrigin, sapClient, baseLink, sapLanguage) {
     };
 }
 
+// ============================================================
+// Resolución del marco (iframe) donde corre la aplicación SAP.
+//
+// El id del iframe NO es estable entre versiones de launchpad: hasta ahora el shell lo llamaba
+// `application-<objeto>-<acción>` y bastaba `iframe[id^="application-"]`; en FLP 1.136.0 el id lo
+// genera UI5 (`__container1-iframe`, con un contador que depende de cuántos contenedores se hayan
+// creado antes) y el nombre semántico queda en `data-help-id`. Con ese selector, TODO paso WEBGUI
+// agota su timeout contra un marco inexistente y el error culpa al control, que sí estaba ahí.
+//
+// Lo invariante es la URL del documento que corre DENTRO: el WEBGUI siempre cuelga de
+// `/sap/bc/gui/sap/its/webgui` y WebDynpro de `/sap/bc/webdynpro/`. Por eso se busca primero por
+// URL —`page.frames()` atraviesa cualquier nivel de anidamiento, cosa que `frameLocator` no hace—
+// y sólo si eso no da nada se cae a los atributos del elemento iframe, cubriendo los tres sitios
+// donde las distintas versiones ponen el nombre semántico.
+//
+// NO apuntar a `__container1-iframe`: el número es un contador de UI5 (en la misma sesión
+// conviven `__container0` y `__container1`), no un nombre.
+// ============================================================
+const APP_DOC_URL = /\/sap\/bc\/gui\/sap\/its\/webgui|\/sap\/bc\/webdynpro\//i;
+const APP_IFRAME_CSS = 'iframe[id^="application-"], iframe[data-help-id^="application-"], iframe[title="Application"]';
+
+// Devuelve el Frame de la aplicación, o null si la app renderiza directamente sobre la página
+// (UI5 puro). Nunca lanza: la página puede cerrarse o el marco desmontarse a mitad.
+async function appFrame(page) {
+    try {
+        const byUrl = page.frames().find(f => APP_DOC_URL.test(f.url()));
+        if (byUrl) return byUrl;
+        const el = await page.$(APP_IFRAME_CSS);
+        return el ? await el.contentFrame() : null;
+    } catch { return null; }
+}
+
+// Ámbitos de búsqueda en orden de preferencia: el marco de la app (si lo hay) y la propia página.
+async function appScopes(page) {
+    const frame = await appFrame(page);
+    return frame ? [frame, page] : [page];
+}
+
+// Sustituye al patrón `locatorDelIframe.or(locatorDeLaPagina)`: `.or()` exige que ambos locators
+// cuelguen del MISMO frame ("Locators must belong to the same frame."), y el marco resuelto por URL
+// es un Frame distinto al de la página. Aquí se lanzan las esperas en paralelo y gana el primer
+// ámbito donde el elemento se hace visible; si ninguno lo consigue se propaga el PRIMER error, que
+// es el timeout con su selector — el que acaba en el mensaje de fallo que llega a MIMO.
+function firstVisible(locators, timeout) {
+    return new Promise((resolve, reject) => {
+        if (!locators.length) return reject(new Error('No hay ámbitos donde buscar el elemento.'));
+        let pending = locators.length, done = false, firstErr = null;
+        for (const loc of locators) {
+            loc.waitFor({ state: 'visible', timeout }).then(
+                () => { if (!done) { done = true; resolve(loc); } },
+                (e) => { firstErr = firstErr || e; if (--pending === 0 && !done) reject(firstErr); }
+            );
+        }
+    });
+}
+
 // Serialización: encadena ejecuciones para que solo corra una sesión de navegador a la vez.
 let _fioriChain = Promise.resolve();
 
@@ -266,7 +322,7 @@ function buildWDStrategies(sel, step) {
 // Se llama al inicio de cada paso: si el diálogo está abierto, lo despacha primero.
 // ============================================================
 async function handleTransportDialog(page) {
-    const scopes = [page.frameLocator('iframe[id^="application-"]').first(), page];
+    const scopes = await appScopes(page);
     for (const scope of scopes) {
         try {
             const localObjBtn = scope.locator('[ct="B"]').filter({ hasText: 'Local Object' }).first();
@@ -497,7 +553,8 @@ async function _execute(script, options) {
                 // desmonta de forma fiable: al SALIR de una WEBGUI el hash no cambia; al ENTRAR a una
                 // WEBGUI el iframe no llega a crearse ("modo UI5 directo" falso). En ambos casos hay
                 // que forzar una recarga completa (about:blank + goto). UI5→UI5 sigue con hash-nav.
-                const _fromWebgui = await page.evaluate(() => !!document.querySelector('iframe[id^="application-"]')).catch(() => false);
+                const _webguiFrame = await appFrame(page);
+                const _fromWebgui = !!_webguiFrame;
                 const _toWebgui = steps.some(s => s && s.technology === 'WEBGUI');
                 if (_fromWebgui || _toWebgui) {
                     if (_fromWebgui) {
@@ -505,7 +562,9 @@ async function _execute(script, options) {
                         // round-trip (p.ej. el commit de "Add Tile Reference"): si no, se aborta y el
                         // cambio NO se guarda. Señales: sin overlay .lsBlockLayer + red inactiva.
                         await page.waitForTimeout(1500);
-                        await page.waitForFunction(() => { const f = document.querySelector('iframe[id^="application-"]'); try { return !f || !f.contentDocument || !f.contentDocument.querySelector('.lsBlockLayer'); } catch (e) { return true; } }, { timeout: 10000 }).catch(() => {});
+                        // La espera corre DENTRO del marco: sin contentDocument no hay restricción de
+                        // same-origin que enmascare el overlay como "ya no está".
+                        await _webguiFrame.waitForFunction(() => !document.querySelector('.lsBlockLayer'), null, { timeout: 10000 }).catch(() => {});
                         // networkidle no se cumple nunca en este launchpad (tiles + sondeo de
                         // notificaciones): trae catch, así que no rompe, pero se agota siempre. La señal
                         // buena es el .lsBlockLayer de arriba; esto queda sólo como margen corto.
@@ -554,12 +613,24 @@ async function _execute(script, options) {
         phase = `ejecución de pasos (${appLink})`;
 
         // 2. ⏳ Esperamos a que Fiori inyecte el iFrame de la aplicación (opcional — apps UI5 puras no lo usan)
+        // La sonda NO declara un modo de renderizado: sólo informa de lo que encontró. Decir
+        // "modo UI5 directo" cuando lo que pasaba era que el selector no casaba con este launchpad
+        // mandó el diagnóstico de FORMS-0000001 contra el modelo equivocado durante toda la corrida.
         console.log(T_ENV + "⏳ Esperando a que el contenedor de la aplicación WebGUI cargue...");
-        try {
-            await page.waitForSelector('iframe[id^="application-"]', { state: 'attached', timeout: 25000 });
-            console.log(T_ENV + "✅ iframe de aplicación detectado.");
-        } catch {
-            console.log(T_ENV + "⚠️ No se detectó iframe — la app renderiza directamente (modo UI5 directo).");
+        {
+            const _deadline = Date.now() + 25000;
+            let _appFrame = null;
+            while (!(_appFrame = await appFrame(page)) && Date.now() < _deadline) {
+                await page.waitForTimeout(500);
+            }
+            if (_appFrame) {
+                console.log(T_ENV + `✅ Marco de aplicación detectado: ${_appFrame.url().slice(0, 120)}`);
+            } else {
+                const _urls = page.frames().map(f => f.url().slice(0, 100));
+                console.log(T_ENV + `⚠️ No se encontró el marco de la aplicación (URL ~ ${APP_DOC_URL} · CSS ~ ${APP_IFRAME_CSS}).`);
+                console.log(T_ENV + `   Marcos presentes (${_urls.length}): ${JSON.stringify(_urls)}`);
+                console.log(T_ENV + "   Si los pasos son WEBGUI/WEBDYNPRO fallarán: se buscará sólo sobre la página.");
+            }
         }
 
         // 🌟 FORZAR MISMA PESTAÑA — inyectado DESPUÉS de que Fiori cargó su iframe,
@@ -735,52 +806,50 @@ async function _execute(script, options) {
 if (step.technology === 'WEBGUI') {
                 console.log(`${T_SUB}📍 SID/Selector: ${step.sid} | Valor: ${step.value || '(N/A)'}`);
                 
-                let locator;
+                // `build(scope)` se evalúa igual sobre el marco de la app y sobre la página; el
+                // único caso asimétrico es el SID de SAP, que sobre `page` usa el motor locateSID
+                // y dentro del marco se busca por el atributo `lsdata` del control.
+                let build;
 
                 if (step.sid.startsWith('#') || step.sid.startsWith('.')) {
                     // Selectores CSS directos (# o .)
-                    const iframeCss = page.frameLocator('iframe[id^="application-"]').first().locator(step.sid);
-                    const directCss = page.locator(step.sid);
-                    locator = iframeCss.or(directCss).first();
-                    
+                    build = (scope) => scope.locator(step.sid).first();
+
                 } else if (step.sid.startsWith('text=')) {
                     // Búsqueda de texto en tablas/listas
                     const searchText = step.sid.replace('text=', '');
-                    const iframeText = page.frameLocator('iframe[id^="application-"]').first().getByText(searchText, { exact: true });
-                    const directText = page.getByText(searchText, { exact: true });
-                    locator = iframeText.or(directText).first();
+                    build = (scope) => scope.getByText(searchText, { exact: true }).first();
 
                 } else if (step.sid.startsWith('split_arrow=')) {
                     // 🌟 NUEVA REGLA: Clic en la flecha de un Dropdown (Split Button)
                     const cleanSid = step.sid.replace('split_arrow=', '');
                     const exactMatchString = `"SID":"${cleanSid}"`;
-                    
-                    // 1. Buscamos la mitad izquierda (el botón principal)
-                    const iframeShell = page.frameLocator('iframe[id^="application-"]').first().locator(`[lsdata*='${exactMatchString}']`);
-                    const directShell = page.locateSID(cleanSid);
-                    const mainBtnLocator = iframeShell.or(directShell).first();
 
+                    // 1. Buscamos la mitad izquierda (el botón principal)
                     // 2. Apuntamos al "hermano" HTML de ese botón, que siempre es la flecha de la derecha
-                    locator = mainBtnLocator.locator('xpath=following-sibling::div[contains(@class, "lsButton--section")]').first();
+                    build = (scope) => (scope === page
+                            ? page.locateSID(cleanSid)
+                            : scope.locator(`[lsdata*='${exactMatchString}']`))
+                        .first()
+                        .locator('xpath=following-sibling::div[contains(@class, "lsButton--section")]').first();
 
                 }  else if (step.sid.startsWith('hover_menu=') || step.sid.startsWith('click_menu=')) {
                     // 🌟 REGLA NUEVA: Menús de SAP
                     const searchText = step.sid.replace(/^(hover_menu=|click_menu=)/, '');
                     // SAP genera el texto y necesitamos exact match para que no de clic en otra cosa
-                    const iframeText = page.frameLocator('iframe[id^="application-"]').first().getByText(searchText, { exact: true });
-                    const directText = page.getByText(searchText, { exact: true });
-                    locator = iframeText.or(directText).first();
+                    build = (scope) => scope.getByText(searchText, { exact: true }).first();
                 }  else {
                     // Lógica normal para SIDs exactos de SAP
                     const exactMatchString = `"SID":"${step.sid}"`;
-                    const iframeLocator = page.frameLocator('iframe[id^="application-"]').first()
-                                              .locator(`[lsdata*='${exactMatchString}']`);
-                    const directLocator = page.locateSID(step.sid);
-                    locator = iframeLocator.or(directLocator).first();
+                    build = (scope) => (scope === page
+                            ? page.locateSID(step.sid)
+                            : scope.locator(`[lsdata*='${exactMatchString}']`)).first();
                 }
 
-                // Esperamos dinámicamente a que el elemento esté visible
-                await locator.waitFor({ state: 'visible', timeout: step.optional ? optionalTimeoutMs : 60000 });
+                // Esperamos dinámicamente a que el elemento esté visible, en el marco de la app y
+                // en la página a la vez: gana el primero que lo tenga.
+                const _scopes = await appScopes(page);
+                const locator = await firstVisible(_scopes.map(build), step.optional ? optionalTimeoutMs : 60000);
 
                 // Paso OPTIONAL sobre un control DESHABILITADO (aria-disabled) → omitir en vez de forzar
                 // el clic. Permite que mimo ponga los 3 botones de referencia (Add Tile/TM, Add Tile,
@@ -821,7 +890,7 @@ if (step.technology === 'WEBGUI') {
                         // frame WEBGUI, la celda EXACTA; si su input no está vacío+editable (fila ocupada),
                         // devolvemos el SID de la primera celda de la misma columna cuyo input SÍ lo esté.
                         const colPrefix = step.sid.replace(/(\[\d+,)\d+\]$/, '$1'); // …UNAME[0,
-                        const _frame = page.frames().find(f => /webgui/i.test(f.url()));
+                        const _frame = await appFrame(page);
                         const targetSid = _frame ? await _frame.evaluate(({ prefix, exact }) => {
                             const usableInput = (c) => {
                                 const i = c.tagName === 'INPUT' ? c : c.querySelector('input, textarea, [contenteditable]');
@@ -840,9 +909,8 @@ if (step.technology === 'WEBGUI') {
                         }, { prefix: colPrefix, exact: step.sid }).catch(() => null) : null;
                         if (targetSid && targetSid !== step.sid) {
                             console.log(`${T_STEP}↪️  Celda ${step.sid} ocupada → primera fila libre (${targetSid}).`);
-                            fillLoc = page.frameLocator('iframe[id^="application-"]').first()
-                                          .locator(`[lsdata*='"SID":"${targetSid}"']`).first()
-                                          .locator('input, textarea, [contenteditable]').first();
+                            fillLoc = _frame.locator(`[lsdata*='"SID":"${targetSid}"']`).first()
+                                             .locator('input, textarea, [contenteditable]').first();
                         }
                     }
                     await fillLoc.fill(step.value);
@@ -857,10 +925,7 @@ if (step.technology === 'WEBGUI') {
                 const sel = step.selector;
                 console.log(`${T_SUB}🧩 WD ct=${sel.ct} text="${sel.text || sel.labelText || sel.name || '(sin texto)'}"${sel.lowConfidence ? ' ⚠️ LOW-CONF' : ''}`);
 
-                const scopes = [
-                    page.frameLocator('iframe[id^="application-"]').first(),
-                    page
-                ];
+                const scopes = await appScopes(page);
                 const strategies = buildWDStrategies(sel, step);
                 let matched = null;
 
@@ -1282,7 +1347,7 @@ if (step.technology === 'WEBGUI') {
         // (o "Discard") antes de cerrar. De lo contrario SAP retiene el enqueue lock
         // del catálogo y bloquea ejecuciones posteriores. Best-effort, no crítico.
         try {
-            const scopes = [page.frameLocator('iframe[id^="application-"]').first(), page];
+            const scopes = await appScopes(page);
             for (const label of ['Cancel', 'Discard', 'Discard Draft']) {
                 for (const scope of scopes) {
                     try {
