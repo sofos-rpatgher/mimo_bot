@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node test/progress-normalize.test.js"
+    "test": "node test/progress-normalize.test.js",
+    "test:rpa": "node test/webgui-frame.test.js"
   },
   "dependencies": {
     "@playwright/test": "npm:@playwright-sap/test@^1.1.6",

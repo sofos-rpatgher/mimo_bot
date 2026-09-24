@@ -67,21 +67,107 @@ async function appScopes(page) {
 
 // Sustituye al patrón `locatorDelIframe.or(locatorDeLaPagina)`: `.or()` exige que ambos locators
 // cuelguen del MISMO frame ("Locators must belong to the same frame."), y el marco resuelto por URL
-// es un Frame distinto al de la página. Aquí se lanzan las esperas en paralelo y gana el primer
-// ámbito donde el elemento se hace visible; si ninguno lo consigue se propaga el PRIMER error, que
-// es el timeout con su selector — el que acaba en el mensaje de fallo que llega a MIMO.
-function firstVisible(locators, timeout) {
+// es un Frame distinto al de la página. Se espera sobre todas las candidatas (ámbito × variante del
+// SID) en paralelo y gana la primera que se hace visible; si ninguna lo consigue se propaga el
+// PRIMER error, que es el timeout con su selector — el que acaba en el mensaje que llega a MIMO.
+// Cada candidata es { label, tolerant, locator }; se devuelve la ganadora entera para poder decir
+// en el log CUÁL ganó (ver B4: un emparejamiento tolerante no debe pasar desapercibido).
+function firstVisible(candidates, timeout) {
     return new Promise((resolve, reject) => {
-        if (!locators.length) return reject(new Error('No hay ámbitos donde buscar el elemento.'));
-        let pending = locators.length, done = false, firstErr = null;
-        for (const loc of locators) {
-            loc.waitFor({ state: 'visible', timeout }).then(
-                () => { if (!done) { done = true; resolve(loc); } },
+        if (!candidates.length) return reject(new Error('No hay candidatas donde buscar el elemento.'));
+        let pending = candidates.length, done = false, firstErr = null;
+        for (const cand of candidates) {
+            cand.locator.waitFor({ state: 'visible', timeout }).then(
+                () => { if (!done) { done = true; resolve(cand); } },
                 (e) => { firstErr = firstErr || e; if (--pending === 0 && !done) reject(firstErr); }
             );
         }
     });
 }
+
+// ============================================================
+// B6 — esperar a que la pantalla WEBGUI se asiente antes de actuar.
+//
+// SAP tapa la pantalla con un `.lsBlockLayer` mientras hay una ida y vuelta al servidor. Los campos
+// que declaran `"14":"SERVER"` disparan ese viaje al cambiar, y el viaje NO termina cuando la acción
+// de Playwright devuelve: puede aterrizar a mitad del paso SIGUIENTE, rehacer la pantalla y dejar la
+// acción colgada — Playwright bloquea una acción mientras el marco navega, en vez de reintentarla.
+// Es lo que mató el `fill` del título en la corrida 982b1bac (30 s, el timeout de acción por
+// defecto, sin líneas de reintento) mientras el mismo paso pasaba en la corrida anterior sólo
+// porque allí el viaje se había consumido dentro del paso previo (49 s).
+//
+// Una sola lectura del overlay NO cierra la carrera: si la petición acaba de salir, el overlay aún
+// no está y la comprobación pasa en verde. Por eso se exige quietud SOSTENIDA — una ventana de
+// gracia para que un overlay ya pedido llegue a aparecer, y después varias lecturas seguidas sin él.
+//
+// Se mira que el overlay sea VISIBLE, no que exista: SAP deja nodos `.lsBlockLayer` ocultos en el
+// DOM, y comprobar sólo presencia haría que cada paso agotara el reloj entero.
+//
+// Best-effort: si se agota, avisa y sigue. Nunca lanza ni convierte un paso en un fallo.
+// ============================================================
+const SETTLE_GRACE_MS    = 300;    // margen para que un overlay ya pedido llegue a aparecer
+const SETTLE_POLL_MS     = 200;    // separación entre lecturas
+const SETTLE_QUIET_POLLS = 3;      // lecturas limpias seguidas que se exigen
+const SETTLE_TIMEOUT_MS  = 20000;  // tope duro; al agotarse se sigue igualmente
+
+// Devuelve true si la pantalla quedó quieta, false si se agotó el tope, null si el marco
+// desapareció a mitad (desprendido o navegando: ya no hay nada que estabilizar ahí).
+async function settleWebgui(frame, page) {
+    const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+    await page.waitForTimeout(SETTLE_GRACE_MS);
+    let quiet = 0;
+    while (Date.now() < deadline) {
+        let busy;
+        try {
+            busy = await frame.evaluate(() => [...document.querySelectorAll('.lsBlockLayer')]
+                .some(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }));
+        } catch { return null; }
+        if (busy) quiet = 0;
+        else if (++quiet >= SETTLE_QUIET_POLLS) return true;
+        await page.waitForTimeout(SETTLE_POLL_MS);
+    }
+    return false;
+}
+
+// ============================================================
+// B4 — el `&` del código de función no es el mismo en todos los sistemas SAP.
+//
+// Que un código de función esté registrado como ESTÁNDAR o como PROPIO de la aplicación es una
+// característica del sistema, no de la grabación. En DS4 (Grupo Mar) las funciones estándar del
+// shell/ALV conservan el `&` — `btn&FIND`, `dbtn&MB_FILTER`, `btn&CREATE_CAT` — y las propias del
+// Content Manager no lo llevan: `dbtnADD_TTMS`, `btnREMOVE_TTMS`. El guion se grabó contra otro
+// sistema, donde ambas lo llevaban, así que sus SID traen `&` de más en las propias.
+//
+// Corregir el dato en MIMO bifurcaría la grabación (contra el SAP original el `&` puede ser el
+// correcto), así que el emparejamiento se hace tolerante: se buscan las dos variantes A LA VEZ y
+// gana la que exista. Cuando gana la tolerante se dice en el log, para que la divergencia sea
+// visible en vez de silenciosa.
+// ============================================================
+function sidWithoutAmp(sid) {
+    const v = sid.replace(/\b(d?btn)&/g, '$1');
+    return v !== sid ? v : null;
+}
+
+// Candidatas para un SID: siempre la exacta y, si el SID lleva `&` tras btn/dbtn, la variante sin él.
+function sidVariants(sid) {
+    const tail = (x) => x.split('/').pop();
+    const out = [{ label: `SID exacto (${tail(sid)})`, tolerant: false, sid }];
+    const alt = sidWithoutAmp(sid);
+    if (alt) out.push({ label: `SID sin "&" (${tail(alt)})`, tolerant: true, sid: alt });
+    return out;
+}
+
+// Un SID se busca por el atributo `lsdata` del control cuando el ámbito es el marco, y con el motor
+// locateSID cuando es la página.
+function sidLocator(scope, page, sid) {
+    return scope === page ? page.locateSID(sid) : scope.locator(`[lsdata*='"SID":"${sid}"']`);
+}
+
+// Internos, exportados sólo para `test/webgui-frame.test.js`: son la lógica de resolución de marco,
+// estabilización y emparejamiento de SID, que es donde se han concentrado los tres últimos fallos
+// en producción. No forman parte de la API del módulo (runFiori) ni deben usarse desde el runner.
+export const __internals = { APP_DOC_URL, APP_IFRAME_CSS, appFrame, appScopes, firstVisible,
+                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator };
 
 // Serialización: encadena ejecuciones para que solo corra una sesión de navegador a la vez.
 let _fioriChain = Promise.resolve();
@@ -562,9 +648,10 @@ async function _execute(script, options) {
                         // round-trip (p.ej. el commit de "Add Tile Reference"): si no, se aborta y el
                         // cambio NO se guarda. Señales: sin overlay .lsBlockLayer + red inactiva.
                         await page.waitForTimeout(1500);
-                        // La espera corre DENTRO del marco: sin contentDocument no hay restricción de
-                        // same-origin que enmascare el overlay como "ya no está".
-                        await _webguiFrame.waitForFunction(() => !document.querySelector('.lsBlockLayer'), null, { timeout: 10000 }).catch(() => {});
+                        // Mismo criterio que el de los pasos (ver settleWebgui): la espera corre DENTRO
+                        // del marco —sin contentDocument no hay same-origin que enmascare el overlay como
+                        // "ya no está"— y exige quietud sostenida, no una sola lectura.
+                        await settleWebgui(_webguiFrame, page);
                         // networkidle no se cumple nunca en este launchpad (tiles + sondeo de
                         // notificaciones): trae catch, así que no rompe, pero se agota siempre. La señal
                         // buena es el .lsBlockLayer de arriba; esto queda sólo como margen corto.
@@ -802,54 +889,68 @@ async function _execute(script, options) {
 
             // Los pasos `optional` (diálogos condicionales) se omiten si su elemento no aparece,
             // en lugar de abortar el intent. Ver `optionalTimeoutMs`.
+            let _stepFrame = null; // marco con el que se ejecutó este paso — lo lee el diagnóstico B6
             try {
 if (step.technology === 'WEBGUI') {
                 console.log(`${T_SUB}📍 SID/Selector: ${step.sid} | Valor: ${step.value || '(N/A)'}`);
                 
-                // `build(scope)` se evalúa igual sobre el marco de la app y sobre la página; el
+                // B6: antes de mirar nada, dejar que la pantalla se asiente. Si la ida y vuelta al
+                // servidor del paso anterior sigue en vuelo, actuar ahora deja la acción colgada.
+                _stepFrame = await appFrame(page);
+                if (_stepFrame) {
+                    const _settled = await settleWebgui(_stepFrame, page);
+                    if (_settled === false) console.log(`${T_SUB}⚠️ La pantalla WEBGUI sigue ocupada tras ${SETTLE_TIMEOUT_MS} ms (overlay .lsBlockLayer visible) — se actúa igualmente.`);
+                    else if (_settled === null) console.log(`${T_SUB}⚠️ El marco de la app desapareció mientras se esperaba a que la pantalla se asentara.`);
+                }
+
+                // Cada candidata se evalúa igual sobre el marco de la app y sobre la página; el
                 // único caso asimétrico es el SID de SAP, que sobre `page` usa el motor locateSID
-                // y dentro del marco se busca por el atributo `lsdata` del control.
-                let build;
+                // y dentro del marco se busca por el atributo `lsdata` del control. Los SID además
+                // aportan una segunda variante sin el `&` del código de función (ver B4).
+                let variants;
 
                 if (step.sid.startsWith('#') || step.sid.startsWith('.')) {
                     // Selectores CSS directos (# o .)
-                    build = (scope) => scope.locator(step.sid).first();
+                    variants = [{ label: 'CSS', tolerant: false, build: (scope) => scope.locator(step.sid).first() }];
 
                 } else if (step.sid.startsWith('text=')) {
                     // Búsqueda de texto en tablas/listas
                     const searchText = step.sid.replace('text=', '');
-                    build = (scope) => scope.getByText(searchText, { exact: true }).first();
+                    variants = [{ label: 'texto', tolerant: false, build: (scope) => scope.getByText(searchText, { exact: true }).first() }];
 
                 } else if (step.sid.startsWith('split_arrow=')) {
                     // 🌟 NUEVA REGLA: Clic en la flecha de un Dropdown (Split Button)
                     const cleanSid = step.sid.replace('split_arrow=', '');
-                    const exactMatchString = `"SID":"${cleanSid}"`;
 
                     // 1. Buscamos la mitad izquierda (el botón principal)
                     // 2. Apuntamos al "hermano" HTML de ese botón, que siempre es la flecha de la derecha
-                    build = (scope) => (scope === page
-                            ? page.locateSID(cleanSid)
-                            : scope.locator(`[lsdata*='${exactMatchString}']`))
-                        .first()
-                        .locator('xpath=following-sibling::div[contains(@class, "lsButton--section")]').first();
+                    variants = sidVariants(cleanSid).map(v => ({ ...v, build: (scope) =>
+                        sidLocator(scope, page, v.sid).first()
+                            .locator('xpath=following-sibling::div[contains(@class, "lsButton--section")]').first() }));
 
                 }  else if (step.sid.startsWith('hover_menu=') || step.sid.startsWith('click_menu=')) {
                     // 🌟 REGLA NUEVA: Menús de SAP
                     const searchText = step.sid.replace(/^(hover_menu=|click_menu=)/, '');
                     // SAP genera el texto y necesitamos exact match para que no de clic en otra cosa
-                    build = (scope) => scope.getByText(searchText, { exact: true }).first();
+                    variants = [{ label: 'texto', tolerant: false, build: (scope) => scope.getByText(searchText, { exact: true }).first() }];
                 }  else {
                     // Lógica normal para SIDs exactos de SAP
-                    const exactMatchString = `"SID":"${step.sid}"`;
-                    build = (scope) => (scope === page
-                            ? page.locateSID(step.sid)
-                            : scope.locator(`[lsdata*='${exactMatchString}']`)).first();
+                    variants = sidVariants(step.sid).map(v => ({ ...v, build: (scope) => sidLocator(scope, page, v.sid).first() }));
                 }
 
                 // Esperamos dinámicamente a que el elemento esté visible, en el marco de la app y
-                // en la página a la vez: gana el primero que lo tenga.
-                const _scopes = await appScopes(page);
-                const locator = await firstVisible(_scopes.map(build), step.optional ? optionalTimeoutMs : 60000);
+                // en la página a la vez, y en las dos variantes del SID: gana la primera que exista.
+                const _scopes = _stepFrame ? [_stepFrame, page] : [page];
+                const _cands = [];
+                for (const scope of _scopes) {
+                    const _where = scope === page ? 'página' : 'marco';
+                    for (const v of variants) _cands.push({ label: `${_where} · ${v.label}`, tolerant: v.tolerant, locator: v.build(scope) });
+                }
+                const _won = await firstVisible(_cands, step.optional ? optionalTimeoutMs : 60000);
+                const locator = _won.locator;
+                // Un emparejamiento tolerante NO debe pasar desapercibido: es la señal de que el
+                // guion y este sistema SAP no coinciden, y de que el dato de MIMO se quedó atrás.
+                if (_won.tolerant) console.log(`${T_SUB}↪️  Emparejado por variante tolerante — ${_won.label}. El SID grabado no existe en este sistema.`);
 
                 // Paso OPTIONAL sobre un control DESHABILITADO (aria-disabled) → omitir en vez de forzar
                 // el clic. Permite que mimo ponga los 3 botones de referencia (Add Tile/TM, Add Tile,
@@ -1231,6 +1332,19 @@ if (step.technology === 'WEBGUI') {
                 if (step.optional) {
                     console.log(`${T_STEP}⏭️  Paso ${i+1} opcional omitido (no apareció): ${(stepErr.message || '').split('\n')[0]}`);
                     continue;
+                }
+                // B6: ¿se movió la pantalla bajo el paso? Decirlo aquí convierte la hipótesis en
+                // dato y evita tener que abrir otro trace.zip para responder la misma pregunta.
+                if (step.technology === 'WEBGUI' && /Timeout/.test(stepErr.message || '')) {
+                    try {
+                        const _detached = _stepFrame ? _stepFrame.isDetached() : null;
+                        const _now = await appFrame(page);
+                        const _other = !!(_stepFrame && _now && _now !== _stepFrame);
+                        const _hash = await page.evaluate(() => location.hash).catch(() => '?');
+                        console.log(`${T_SUB}🔬 DIAG B6: marco del paso = ${_stepFrame ? (_detached ? 'DESPRENDIDO — la pantalla se reemplazó bajo el paso' : 'vivo') : 'no había'}`
+                            + ` · marco actual = ${_now ? _now.url().slice(0, 90) : 'ninguno'}${_other ? ' (es OTRO marco)' : ''}`
+                            + ` · hash = ${_hash}`);
+                    } catch (e) { /* diagnóstico best-effort */ }
                 }
                 if (step.technology === 'UI5' && /Timeout/.test(stepErr.message || '')) {
                     try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) vis++; } }); return { title, n, vis, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis} hash=${diag.hash}`); } catch (e) {}
