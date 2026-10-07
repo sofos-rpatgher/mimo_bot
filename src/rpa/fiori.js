@@ -1146,11 +1146,14 @@ if (step.technology === 'WEBGUI') {
 
                     const core = hasGetCore ? sapObj.ui.getCore() : null;
 
-                    // 1. Búsqueda por ID estático. Si el id existe → ok. Si NO (p.ej. id con clone
-                    // volátil "-__cloneN" que cambia entre renders), NO abortar: seguir con la
-                    // búsqueda por tipo+propiedades+visibilidad.
-                    if (core && sSel.id && !sSel.id.startsWith("__") && core.byId(sSel.id)) {
-                        return true;
+                    // 1. Búsqueda por ID estático. Si el id existe Y está pintado → ok. Si NO (p.ej. id
+                    // con clone volátil "-__cloneN" que cambia entre renders, o control aún sin DOM),
+                    // NO abortar: seguir con la búsqueda por tipo+propiedades+visibilidad. Mismo
+                    // criterio de visibilidad que el camino 2 (y que findControl en el paso de acción).
+                    const byId = (core && sSel.id && !sSel.id.startsWith("__")) ? core.byId(sSel.id) : null;
+                    if (byId) {
+                        const d = byId.getDomRef && byId.getDomRef(); const r = d && d.getBoundingClientRect();
+                        if (r && r.width > 0 && r.height > 0) return true;
                     }
 
                     // 2. Búsqueda dinámica en el registro de elementos
@@ -1222,7 +1225,13 @@ if (step.technology === 'WEBGUI') {
                     const core = typeof sapObj.ui.getCore === 'function' ? sapObj.ui.getCore() : null;
                     const isFill = (sAction === 'fill' || sAction === 'change' || sAction === 'enterText');
                     const findControl = (s) => {
-                        if (core && s.id && !s.id.startsWith("__")) { const c = core.byId(s.id); if (c) return c; }
+                        // Por id solo si está pintado; si no, se busca uno visible en el registro y el
+                        // de id queda como último recurso (fill por setValue no necesita DOM).
+                        const byId = (core && s.id && !s.id.startsWith("__")) ? core.byId(s.id) : null;
+                        if (byId) {
+                            const d = byId.getDomRef && byId.getDomRef(); const r = d && d.getBoundingClientRect();
+                            if (r && r.width > 0 && r.height > 0) return byId;
+                        }
                         // Preferir la coincidencia VISIBLE (con DOM renderizado): p.ej. hay varios
                         // botones "Add Section"/"Add" y solo uno está visible; los ocultos/plantilla no
                         // sirven. Para FILL, preferir además el input con valor VACÍO — así el título
@@ -1258,7 +1267,7 @@ if (step.technology === 'WEBGUI') {
                                 }
                             }
                         });
-                        return foundEmpty || foundEnabled || foundVisible || found;
+                        return foundEmpty || foundEnabled || foundVisible || byId || found;
                     };
                     let oControl = findControl(sSel);
                     if (!oControl) return { ok: false };
@@ -1318,12 +1327,17 @@ if (step.technology === 'WEBGUI') {
                     const dom = (oControl.getFocusDomRef && oControl.getFocusDomRef()) || (oControl.getDomRef && oControl.getDomRef());
                     if (!dom) return { ok: false };
                     dom.setAttribute('data-fiori-click', '1');
-                    return { ok: true, click: true };
+                    // Devolver también el id del nodo: si UI5 repinta entre este evaluate y el clic,
+                    // el nodo nuevo ya no lleva el atributo, pero sí conserva el id.
+                    return { ok: true, click: true, domId: dom.id || null };
                 }, { sAction: step.action, sSel: sel, sValue: step.value });
                 if (!_outcome || !_outcome.ok) throw new Error(`Control UI5[${sel.controlType}] desapareció o no tiene DOM.`);
                 if (_outcome.comboNoMatch) console.warn(`${T_SUB}⚠️ ComboBox: el valor "${_outcome.comboNoMatch.value}" NO coincide con ningún item — keys disponibles: ${JSON.stringify(_outcome.comboNoMatch.keys)}. El campo quedará vacío (revisa el key inyectado o si el runner tiene el fix de ComboBox).`);
                 if (_outcome.click) {
-                    await page.locator('[data-fiori-click="1"]').first().click({ force: true });
+                    // Por id cuando lo hay (Playwright lo vuelve a resolver tras un repintado); el
+                    // atributo marcado queda solo para nodos sin id.
+                    const _clickLoc = _outcome.domId ? page.locator(`id=${_outcome.domId}`) : page.locator('[data-fiori-click="1"]');
+                    await _clickLoc.first().click({ force: true });
                     await page.evaluate(() => document.querySelectorAll('[data-fiori-click]').forEach(n => n.removeAttribute('data-fiori-click')));
                 }
             }
