@@ -464,6 +464,9 @@ async function _execute(script, options) {
     // condicionalmente) usan este timeout corto y, si el elemento no aparece, se OMITEN sin fallar
     // el intent. Un paso normal ausente sigue fallando con el timeout largo (60 s).
     const optionalTimeoutMs = options.optionalTimeoutMs || 8000;
+    // Tiles KPI de Smart Business: bloqueadas por defecto (ver el page.route más abajo). Se cargan
+    // con `blockKpiTiles: false` o MIMO_LOAD_KPI_TILES=1.
+    const blockKpiTiles = options.blockKpiTiles !== undefined ? !!options.blockKpiTiles : process.env.MIMO_LOAD_KPI_TILES !== '1';
     // --- Idioma de la sesión: DEBE ser inglés -------------------------------------------------
     // No es una preferencia: SAPLogin detecta los campos por texto ("User"/"Password"/"Log On") y
     // los selectores de los pasos están grabados en inglés ("Local Object", "Save", headers de
@@ -592,7 +595,25 @@ async function _execute(script, options) {
     const browser = await chromium.launch({ headless, slowMo });
     const context = await browser.newContext({ ignoreHTTPSErrors: true, locale });
     if (debug) await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+    // B8: ~35-45 s después de cada carga completa del FLP, el shell instancia en segundo plano las
+    // tiles KPI de Smart Business del home (~300 en el job a37ac721: numeric, dual, contribution…,
+    // cada una pidiendo su manifest y su fragmento). Durante ~50 s el hilo principal queda saturado:
+    // cada evaluate tarda 5-10 s y un clic sobre un botón ya presente agotó sus 30 s (15 s en resolver
+    // el localizador + 14 s en hacer scroll). El bot nunca trabaja con esas tiles — sólo las ve el
+    // home, que no se muestra — así que no se descarga su código; quedan como tiles vacías.
+    // Por CDP y no con page.route: route() desactiva la caché HTTP, y cada recarga limpia volvería a
+    // bajar UI5 entero.
     const page = await context.newPage();
+    if (blockKpiTiles) {
+        try {
+            const _cdp = await context.newCDPSession(page);
+            await _cdp.send('Network.enable');
+            await _cdp.send('Network.setBlockedURLs', { urls: ['*/sap/bc/ui5_ui5/sap/ssbtiles*'] });
+            console.log("🚫 Tiles KPI de Smart Business bloqueadas (MIMO_LOAD_KPI_TILES=1 para cargarlas).");
+        } catch (e) {
+            console.warn(`⚠️ No se pudieron bloquear las tiles KPI (${e.message}); se sigue sin bloqueo.`);
+        }
+    }
 
     try {
         // Login SIEMPRE en el FLP home (BASE_LINK, construido con el origin + client destino).
