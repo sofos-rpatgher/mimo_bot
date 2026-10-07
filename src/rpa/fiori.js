@@ -626,7 +626,7 @@ async function _execute(script, options) {
         // ── Helpers reutilizables (intents normales Y aggregated_intents) ──────────────
         // arriveAtApp: navega a la app (con la lógica WEBGUI/same-app), detecta el entorno
         // y engancha el force-same-tab. runStepList: ejecuta una lista de pasos SIN navegar.
-        async function arriveAtApp(appLink, steps) {
+        async function arriveAtAppOnce(appLink, steps, forceReload) {
                 phase = `navegación a la app (${appLink})`;
                 console.log("  ┃  ┃  ┃  🚀 Navegando →", appLink);
                 emit({ level: 'INFO', done: stepsDone, total: totalSteps, ...ctx(), message: `Navigating → ${appLink}` });
@@ -642,7 +642,11 @@ async function _execute(script, options) {
                 const _webguiFrame = await appFrame(page);
                 const _fromWebgui = !!_webguiFrame;
                 const _toWebgui = steps.some(s => s && s.technology === 'WEBGUI');
-                if (_fromWebgui || _toWebgui) {
+                if (forceReload) {
+                    console.log(`  ┃  ┃  ┃  🔁 reintento tras caída de la app → recarga limpia (about:blank + goto)`);
+                    await page.goto('about:blank').catch(() => {});
+                    await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                } else if (_fromWebgui || _toWebgui) {
                     if (_fromWebgui) {
                         // Antes de DESTRUIR la iframe WEBGUI de origen, esperar a que termine su último
                         // round-trip (p.ej. el commit de "Add Tile Reference"): si no, se aborta y el
@@ -703,6 +707,12 @@ async function _execute(script, options) {
         // La sonda NO declara un modo de renderizado: sólo informa de lo que encontró. Decir
         // "modo UI5 directo" cuando lo que pasaba era que el selector no casaba con este launchpad
         // mandó el diagnóstico de FORMS-0000001 contra el modelo equivocado durante toda la corrida.
+        // Si todos los pasos son UI5 no hay marco que esperar: la sonda sólo quemaba 25 s por intent
+        // (job 544af7a4: de 34,5 s a ~62 s buscando un iframe que una app UI5 nunca crea).
+        const _needsFrame = !steps.length || steps.some(s => !s || s.technology !== 'UI5');
+        if (!_needsFrame) {
+            console.log(T_ENV + "⏭️  Pasos sólo UI5: no se espera marco WebGUI.");
+        } else {
         console.log(T_ENV + "⏳ Esperando a que el contenedor de la aplicación WebGUI cargue...");
         {
             const _deadline = Date.now() + 25000;
@@ -718,6 +728,7 @@ async function _execute(script, options) {
                 console.log(T_ENV + `   Marcos presentes (${_urls.length}): ${JSON.stringify(_urls)}`);
                 console.log(T_ENV + "   Si los pasos son WEBGUI/WEBDYNPRO fallarán: se buscará sólo sobre la página.");
             }
+        }
         }
 
         // 🌟 FORZAR MISMA PESTAÑA — inyectado DESPUÉS de que Fiori cargó su iframe,
@@ -859,6 +870,48 @@ async function _execute(script, options) {
         console.log(T_ENV + "✅ Entorno detectado. Iniciando ejecución híbrida...");
 
         // 2. Iterar sobre los pasos grabados
+        }
+
+        // B7: en frío, la app (o el runtime de páginas del home) puede caerse al arrancar y no se
+        // recupera sola. Job 544af7a4: hash-nav a #FLPPage-manage con el home aún arrancando →
+        // TypeError en sui_page_man (`getODataEntityContainer` sin metamodelo) a los 4,4 s, y la
+        // página de error de FLP (`…--errorPage`) hasta el timeout del paso 90 s después.
+        // Tras navegar se vigila hasta 10 s: contenedor de la app pintado → ok; página de error
+        // o excepción no capturada → recarga limpia UNA vez. Si vuelve a caer, sólo se avisa: el
+        // paso fallará con su propio DIAG.
+        async function watchAppStart(appLink, errs) {
+            const _tgt = (appLink.includes('#') ? appLink.slice(appLink.indexOf('#') + 1) : '').split(/[&\/?]/)[0];
+            const _deadline = Date.now() + (_tgt ? 10000 : 2000);   // sin hash no hay contenedor que esperar
+            while (Date.now() < _deadline) {
+                const s = await page.evaluate((tgt) => {
+                    const vis = (el) => { const r = el && el.getBoundingClientRect(); return !!(r && r.width > 0 && r.height > 0); };
+                    if (Array.from(document.querySelectorAll('[id$="--errorPage"]')).some(vis)) return 'errorPage';
+                    if (tgt && Array.from(document.querySelectorAll(`[id^="application-${tgt}"]`)).some(vis)) return 'ok';
+                    return null;
+                }, _tgt).catch(() => null);
+                if (s === 'ok') return null;
+                if (s === 'errorPage') return 'página de error de FLP';
+                if (errs.length) return `excepción no capturada: ${(errs[0].message || '').split('\n')[0]}`;
+                await page.waitForTimeout(500);
+            }
+            return null;
+        }
+        async function arriveAtApp(appLink, steps) {
+            const _errs = [];
+            const _onErr = (e) => _errs.push(e);
+            page.on('pageerror', _onErr);
+            try {
+                await arriveAtAppOnce(appLink, steps, false);
+                const _crash = await watchAppStart(appLink, _errs);
+                if (!_crash) return;
+                console.log(`  ┃  ┃  ┃  💥 La app se cayó al arrancar (${_crash}).`);
+                _errs.length = 0;
+                await arriveAtAppOnce(appLink, steps, true);
+                const _again = await watchAppStart(appLink, _errs);
+                if (_again) console.warn(`  ┃  ┃  ┃  ⚠️ La app volvió a caerse tras recargar (${_again}); se sigue y el paso dirá qué hay en pantalla.`);
+            } finally {
+                page.off('pageerror', _onErr);
+            }
         }
         async function runStepList(steps) {
         for (let i = 0; i < steps.length; i++) {
