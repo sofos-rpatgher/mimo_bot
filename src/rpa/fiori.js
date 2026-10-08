@@ -1403,7 +1403,8 @@ if (step.technology === 'WEBGUI') {
                     dom.setAttribute('data-fiori-click', '1');
                     // Devolver también el id del nodo: si UI5 repinta entre este evaluate y el clic,
                     // el nodo nuevo ya no lleva el atributo, pero sí conserva el id.
-                    return { ok: true, click: true, domId: dom.id || null };
+                    const _pop = dom.getAttribute('aria-haspopup');
+                    return { ok: true, click: true, domId: dom.id || null, popup: !!_pop && _pop !== 'false' };
                 }, { sAction: step.action, sSel: sel, sValue: step.value });
                 if (!_outcome || !_outcome.ok) throw new Error(`Control UI5[${sel.controlType}] desapareció o no tiene DOM.`);
                 if (_outcome.comboNoMatch) console.warn(`${T_SUB}⚠️ ComboBox: el valor "${_outcome.comboNoMatch.value}" NO coincide con ningún item — keys disponibles: ${JSON.stringify(_outcome.comboNoMatch.keys)}. El campo quedará vacío (revisa el key inyectado o si el runner tiene el fix de ComboBox).`);
@@ -1412,6 +1413,20 @@ if (step.technology === 'WEBGUI') {
                     // atributo marcado queda solo para nodos sin id.
                     const _clickLoc = _outcome.domId ? page.locator(`id=${_outcome.domId}`) : page.locator('[data-fiori-click="1"]');
                     await _clickLoc.first().click({ force: true });
+                    // B9: un botón que abre menú (aria-haspopup) puede abrirlo y verlo cerrarse solo si la
+                    // vista todavía se está asentando. Job 53ba0fa1: el «⋯» del selector de tiles abrió su
+                    // popover a los 314,3 s y a los 314,4 s ya estaba cerrado (aria-expanded="false"), justo
+                    // cuando el selector acababa de cargar sus datos; el paso siguiente esperó 30 s a
+                    // «Catalogs» dentro de un menú que ya no existía. Si el menú se cerró, reabrirlo.
+                    if (_outcome.popup) {
+                        for (let _r = 0; _r < 2; _r++) {
+                            await page.waitForTimeout(800);
+                            const _exp = await _clickLoc.first().getAttribute('aria-expanded', { timeout: 2000 }).catch(() => null);
+                            if (_exp !== 'false') break;   // abierto, o el control no informa aria-expanded
+                            console.log(`${T_SUB}🔁 El menú de ${sel.controlType} se cerró solo tras el clic; se vuelve a abrir (${_r + 1}/2).`);
+                            await _clickLoc.first().click({ force: true });
+                        }
+                    }
                     await page.evaluate(() => document.querySelectorAll('[data-fiori-click]').forEach(n => n.removeAttribute('data-fiori-click')));
                 }
             }
