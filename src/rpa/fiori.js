@@ -401,18 +401,25 @@ function buildWDStrategies(sel, step) {
     return strategies;
 }
 
+// Tope de espera de un paso optional WEBGUI una vez asentada la pantalla (ver la rama WEBGUI).
+const WEBGUI_OPTIONAL_TIMEOUT_MS = 3000;
+
 // ============================================================
 // Maneja el diálogo "Select Transport Request" que SAP muestra al añadir/editar
 // en catálogos gestionados por transporte. La grabación no lo contempla porque se
 // hizo en un entorno con transporte autoasignado. Clic en "Local Object" ($TMP).
 // Se llama al inicio de cada paso: si el diálogo está abierto, lo despacha primero.
+// Comprobación instantánea, sin espera: antes esperaba 1,5 s por scope antes de CADA paso, y en el
+// job 0b12b73c fueron 242 esperas (~6 min de 31) sin que el diálogo apareciera ni una vez. El caso
+// de un diálogo que llega tras la ida y vuelta del paso anterior lo cubre la segunda llamada, que
+// la rama WEBGUI hace ya con la pantalla asentada.
 // ============================================================
 async function handleTransportDialog(page) {
     const scopes = await appScopes(page);
     for (const scope of scopes) {
         try {
             const localObjBtn = scope.locator('[ct="B"]').filter({ hasText: 'Local Object' }).first();
-            await localObjBtn.waitFor({ state: 'visible', timeout: 1500 });
+            if (!(await localObjBtn.isVisible())) continue;
             console.log('   🚚 Diálogo "Select Transport Request" detectado → clic en "Local Object".');
             await localObjBtn.click({ force: true });
             await page.waitForTimeout(1500);
@@ -1043,6 +1050,9 @@ if (step.technology === 'WEBGUI') {
                     const _settled = await settleWebgui(_stepFrame, page);
                     if (_settled === false) console.log(`${T_SUB}⚠️ La pantalla WEBGUI sigue ocupada tras ${SETTLE_TIMEOUT_MS} ms (overlay .lsBlockLayer visible) — se actúa igualmente.`);
                     else if (_settled === null) console.log(`${T_SUB}⚠️ El marco de la app desapareció mientras se esperaba a que la pantalla se asentara.`);
+                    // Con la pantalla ya asentada, un diálogo de transporte que haya abierto el paso
+                    // anterior ya está pintado.
+                    if (await handleTransportDialog(page)) _stepFrame = await appFrame(page);
                 }
 
                 // B11: una ventana de SAP abierta ENCIMA (wnd[k], k > la del paso) es modal: los clics
@@ -1111,7 +1121,11 @@ if (step.technology === 'WEBGUI') {
                     const _where = scope === page ? 'página' : 'marco';
                     for (const v of variants) _cands.push({ label: `${_where} · ${v.label}`, tolerant: v.tolerant, locator: v.build(scope) });
                 }
-                const _won = await firstVisible(_cands, step.optional ? optionalTimeoutMs : 60000);
+                // Un paso optional WEBGUI se evalúa con la pantalla ya asentada (settleWebgui): si su
+                // control no está a esas alturas, no va a aparecer. Esperar los 8 s completos costaba
+                // ~2 min en el job 0b12b73c (p. ej. ADD_TILES/ADD_TMS tras haber usado ADD_TTMS).
+                const _optMs = _stepFrame ? Math.min(optionalTimeoutMs, WEBGUI_OPTIONAL_TIMEOUT_MS) : optionalTimeoutMs;
+                const _won = await firstVisible(_cands, step.optional ? _optMs : 60000);
                 const locator = _won.locator;
                 // Un emparejamiento tolerante NO debe pasar desapercibido: es la señal de que el
                 // guion y este sistema SAP no coinciden, y de que el dato de MIMO se quedó atrás.
