@@ -615,6 +615,73 @@ async function _execute(script, options) {
         }
     }
 
+    // B10: peticiones de escritura en vuelo. Job 0b12b73c: el Save de Manage Pages (POST pageSet
+    // con 4 tiles) salió a los 1109,3 s y a los 1110,6 s el bot navegó a about:blank para el intent
+    // siguiente; el navegador canceló la petición (sin respuesta) y el intent se dio por bueno.
+    // Se espera a que terminen al cerrar cada intent/item (settleWrites, que además falla si SAP
+    // rechazó alguna) y, como red de seguridad, antes de navegar o cerrar el navegador.
+    const _pendingWrites = new Set();
+    const _writeErrors = [];
+    const _isWrite = (r) => !/^(GET|HEAD|OPTIONS)$/i.test(r.method());
+    page.on('request', (r) => { if (_isWrite(r)) _pendingWrites.add(r); });
+    page.on('requestfinished', async (r) => {
+        // La petición sigue "pendiente" hasta haber leído su respuesta: así settleWrites no puede
+        // adelantarse a la inspección.
+        try { if (_isWrite(r) && /\/sap\/opu\//.test(r.url())) { const err = await odataWriteError(r); if (err) _writeErrors.push(err); } }
+        catch { /* inspección best-effort: nunca rompe la ejecución */ }
+        finally { _pendingWrites.delete(r); }
+    });
+    page.on('requestfailed', (r) => {
+        // Una escritura OData que muere sin respuesta (red, o cancelada por una navegación) no dice
+        // si SAP la aplicó: cuenta como no confirmada.
+        if (_pendingWrites.delete(r) && /\/sap\/opu\//.test(r.url()))
+            _writeErrors.push(`${r.method()} ${r.url().split('?')[0].replace(/^.*\/sap\/opu\/odata4?\//, '')} → sin respuesta (${(r.failure() || {}).errorText || 'cancelada'})`);
+    });
+
+    // B12: ¿rechazó SAP la escritura? Un $batch responde 202 aunque su changeset haya fallado: el
+    // error va DENTRO, en la parte del changeset. Sólo cuentan los changesets (las escrituras); una
+    // lectura que falle dentro del mismo batch no hace fallar el intent.
+    async function odataWriteError(r) {
+        const res = await r.response();
+        if (!res) return null;
+        const where = `${r.method()} ${r.url().split('?')[0].replace(/^.*\/sap\/opu\/odata4?\//, '')}`;
+        const body = await res.text().catch(() => '');
+        const msg = (t) => {
+            const j = t.match(/"message"\s*:\s*(?:\{[^{}]*?"value"\s*:\s*)?"((?:[^"\\]|\\.)*)"/);
+            return j ? j[1] : ((t.match(/<message[^>]*>([^<]*)<\/message>/) || [])[1] || '');
+        };
+        if (res.status() >= 400) return `${where} → HTTP ${res.status()} ${msg(body)}`.trim();
+        const reqB = ((await r.allHeaders())['content-type'] || '').match(/boundary=([^;\s]+)/);
+        const resB = ((await res.allHeaders())['content-type'] || '').match(/boundary=([^;\s]+)/);
+        if (!reqB || !resB) return null;
+        const parts = (t, b) => t.split('--' + b).slice(1, -1);
+        const reqParts = parts(r.postData() || '', reqB[1]), resParts = parts(body, resB[1]);
+        for (let i = 0; i < reqParts.length; i++) {
+            if (!/multipart\/mixed/i.test(reqParts[i])) continue;   // no es un changeset → lectura
+            const bad = [...(resParts[i] || '').matchAll(/HTTP\/1\.1 (\d{3})/g)].map(m => +m[1]).find(st => st >= 400);
+            if (bad) return `${where} → changeset ${i + 1}: HTTP ${bad} ${msg(resParts[i])}`.trim();
+        }
+        return null;
+    }
+
+    async function waitPendingWrites(why, timeoutMs = 30000) {
+        if (!_pendingWrites.size) return [];
+        const t = Date.now();
+        console.log(`  ┃  ┃  ┃  ⏳ ${_pendingWrites.size} petición(es) de escritura en vuelo antes de ${why}; esperando a que terminen...`);
+        while (_pendingWrites.size && Date.now() - t < timeoutMs) await page.waitForTimeout(250);
+        const left = [..._pendingWrites].map(r => `${r.method()} ${r.url().split('?')[0].slice(-80)}`);
+        if (left.length) console.warn(`  ┃  ┃  ┃  ⚠️ Siguen ${left.length} escritura(s) sin respuesta tras ${timeoutMs / 1000} s: ${left.join(' · ')}`);
+        return left;
+    }
+    // Cierre de un intent/item: sus escrituras tienen que haber terminado y SAP no puede haber
+    // rechazado ninguna. Si no, el intent falla aquí — no el siguiente.
+    async function settleWrites(where) {
+        const left = await waitPendingWrites(where);
+        const errs = _writeErrors.splice(0);
+        if (left.length) errs.push(...left.map(u => `${u} → sin respuesta`));
+        if (errs.length) throw new Error(`SAP no confirmó ${errs.length} escritura(s) al ${where}: ${errs.join(' · ')}`);
+    }
+
     try {
         // Login SIEMPRE en el FLP home (BASE_LINK, construido con el origin + client destino).
         // Toda la navegación a apps la realiza el bucle de intents (cada intent con su propio path).
@@ -648,6 +715,7 @@ async function _execute(script, options) {
         // arriveAtApp: navega a la app (con la lógica WEBGUI/same-app), detecta el entorno
         // y engancha el force-same-tab. runStepList: ejecuta una lista de pasos SIN navegar.
         async function arriveAtAppOnce(appLink, steps, forceReload) {
+                await waitPendingWrites('navegar');
                 phase = `navegación a la app (${appLink})`;
                 console.log("  ┃  ┃  ┃  🚀 Navegando →", appLink);
                 emit({ level: 'INFO', done: stepsDone, total: totalSteps, ...ctx(), message: `Navigating → ${appLink}` });
@@ -975,6 +1043,29 @@ if (step.technology === 'WEBGUI') {
                     const _settled = await settleWebgui(_stepFrame, page);
                     if (_settled === false) console.log(`${T_SUB}⚠️ La pantalla WEBGUI sigue ocupada tras ${SETTLE_TIMEOUT_MS} ms (overlay .lsBlockLayer visible) — se actúa igualmente.`);
                     else if (_settled === null) console.log(`${T_SUB}⚠️ El marco de la app desapareció mientras se esperaba a que la pantalla se asentara.`);
+                }
+
+                // B11: una ventana de SAP abierta ENCIMA (wnd[k], k > la del paso) es modal: los clics
+                // con force sobre la de abajo caen en su capa y SAP los ignora, pero Playwright los da
+                // por buenos. Job 0b12b73c: al asignar el catálogo al rol, PFCG abrió un "Log Display"
+                // (wnd[1]) con 2 errores de autorización; el Save y el Back sobre wnd[0] "funcionaron"
+                // sin hacer nada y el intent se reportó como completado sin haber guardado. Se espera
+                // un poco por si la ventana se está cerrando; si sigue, se falla con su contenido.
+                const _tgtWnd = (String(step.sid || '').replace(/^split_arrow=/, '').match(/^wnd\[(\d+)\]/) || [])[1];
+                if (_tgtWnd != null && _stepFrame) {
+                    const _above = () => _stepFrame.evaluate((n) => {
+                        for (const el of document.querySelectorAll('[lsdata*=\'"SID":"wnd[\']')) {
+                            const m = (el.getAttribute('lsdata') || '').match(/"SID":"wnd\[(\d+)\]"/);
+                            if (!m || +m[1] <= n) continue;
+                            const r = el.getBoundingClientRect();
+                            if (!(r.width > 0 && r.height > 0)) continue;
+                            return { wnd: +m[1], text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400) };
+                        }
+                        return null;
+                    }, +_tgtWnd).catch(() => null);
+                    let _pop = await _above();
+                    for (let k = 0; _pop && k < 10; k++) { await page.waitForTimeout(500); _pop = await _above(); }
+                    if (_pop) throw new Error(`Ventana de SAP abierta encima (wnd[${_pop.wnd}]): el paso actúa sobre wnd[${_tgtWnd}], que no acepta acciones mientras siga abierta. Contenido: "${_pop.text}"`);
                 }
 
                 // Cada candidata se evalúa igual sobre el marco de la app y sobre la página; el
@@ -1483,6 +1574,7 @@ if (step.technology === 'WEBGUI') {
                 console.log(`  ┃  ┃  ┣━ INTENT ${intent.intent_seq ?? '?'} · ${intent.intent_id || '?'}  (${steps.length} pasos)`);
                 await arriveAtApp(appLink, steps);
                 await runStepList(steps);
+                await settleWrites('cerrar el intent');
                 result.intentsCompleted++;
               } // fin INTENT
               // Instancia completada (item-level): reportar su iid si lo trae.
@@ -1517,7 +1609,7 @@ if (step.technology === 'WEBGUI') {
                   // Línea de progreso de este item (misma `id` para started → STEP updates → completed).
                   instCtx = { label: `Instance ${_itemIdx}`, total: (item.code || []).length || 1, done: 0 };
                   emit({ level: 'INFO', percent: 0, done: stepsDone, total: totalSteps, block: block.block_id, instruction: instr.instruction_id, instance: _itemIdx, intent: entry.intent_id, message: `▶ Instance ${_itemIdx} — 0%` });
-                  try { await runStepList(item.code || []); }
+                  try { await runStepList(item.code || []); await settleWrites('cerrar el item'); }
                   catch (e) { _pendingErr = e; instCtx = null; break; }   // fallo de item → parar el bucle
                   result.completedInstanceIids.push(item.instance_iid);
                   result.intentsCompleted++;
@@ -1533,6 +1625,7 @@ if (step.technology === 'WEBGUI') {
                 if (!_pendingErr) { current.instance = null; current.instance_iid = null; }
                 instCtx = null;
                 if (finalize.length) { try { console.log(`  ┃  ┃  ┗━ finalize (${finalize.length} pasos)`); await runStepList(finalize); } catch (e) { if (!_pendingErr) _pendingErr = e; } }
+                try { await settleWrites('cerrar el grupo'); } catch (e) { if (!_pendingErr) _pendingErr = e; }
               }
               if (_pendingErr) throw _pendingErr;                   // propaga; current apunta al item fallido
             }
@@ -1560,6 +1653,7 @@ if (step.technology === 'WEBGUI') {
         result.failure = { ...(current || {}), phase, url: pageUrl || BASE_LINK, username, serverOrigin, sapClient, system: sapSystem, message: detail };
         console.error(`\n❌ Error en la ejecución (intent=${current?.intent ?? '?'}, paso=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${detail}`);
     } finally {
+        await waitPendingWrites('cerrar').catch(() => {});
         // 🔓 Liberar el lock de SAP: si quedamos en modo edición, salir con "Cancel"
         // (o "Discard") antes de cerrar. De lo contrario SAP retiene el enqueue lock
         // del catálogo y bloquea ejecuciones posteriores. Best-effort, no crítico.
