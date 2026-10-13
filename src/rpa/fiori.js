@@ -429,6 +429,31 @@ async function handleTransportDialog(page) {
     return false;
 }
 
+// B13: espera de renderizado del paso que sigue a abrir un menú. El menú puede cerrarse solo
+// segundos después de abrirse si la vista sigue cargando: job 93cf80c4, el «⋯» del editor de páginas
+// se pinchó 1,3 s después de «Edit», el menú se abrió (797,8 s), pasó la comprobación de B9 (798,4 s)
+// y se cerró hacia los 800 s al repintarse el editor, que terminó de cargar a los 810 s; el paso
+// siguiente esperó 30 s a «Select Catalogs» fuera de pantalla. Aquí la espera se trocea y, entre
+// trozos, si el menú está cerrado (aria-expanded="false") se vuelve a abrir — sea cuando sea que se
+// cerró. Sin opener es la espera de siempre, de una pieza.
+async function waitWithMenuReopen(waitFor, opener, totalMs, log) {
+    if (!opener) return waitFor(totalMs);
+    const deadline = Date.now() + totalMs;
+    let reopened = 0;
+    for (;;) {
+        try { return await waitFor(Math.max(500, Math.min(3000, deadline - Date.now()))); }
+        catch (e) {
+            if (Date.now() >= deadline) throw e;
+            const exp = await opener.loc.getAttribute('aria-expanded', { timeout: 2000 }).catch(() => null);
+            if (exp === 'false' && reopened < 3) {
+                reopened++;
+                log(`🔁 El menú de ${opener.type} se cerró antes de usarlo; se vuelve a abrir (${reopened}/3).`);
+                await opener.loc.click({ force: true }).catch(() => {});
+            }
+        }
+    }
+}
+
 // Comparador por número de secuencia (block_seq, instruction_seq, instance_seq, intent_seq).
 // La jerarquía multi-intent se recorre anidada (block → instruction → instance → intent),
 // con logs por nivel para trazabilidad y futuro manejo de errores por paso.
@@ -1010,8 +1035,10 @@ async function _execute(script, options) {
             }
         }
         async function runStepList(steps) {
+        let _menuOpener = null;   // B13: control que el paso anterior usó para abrir un menú
         for (let i = 0; i < steps.length; i++) {
             const step = steps[i];
+            const _opener = _menuOpener; _menuOpener = null;
             stepsDone++; // progreso por acción: cada paso procesado (incluidos los optional omitidos) cuenta
             if (current) { current.stepIndex = i + 1; current.action = step.action; current.sid = step.sid || (step.selector && step.selector.ct) || null; }
             console.log(`\n${T_STEP}⏳ [Paso ${i+1}/${steps.length}] Tecnología: ${step.technology} | Acción: ${step.action.toUpperCase()}`);
@@ -1317,7 +1344,7 @@ if (step.technology === 'WEBGUI') {
                 console.log(`${T_SUB}🧩 UI5 Control: ${sel.controlType} | ⏳ Esperando renderizado...`);
 
                 // 🛠️ MEJORA 2: Polling Inteligente para esperar a que los Tiles/Controles existan
-                await page.waitForFunction((sSel) => {
+                const _waitRender = (ms) => page.waitForFunction((sSel) => {
                     const sapObj = window.sap || window.top.sap;
                     if (!sapObj || !sapObj.ui) return false;
                     const hasGetCore = typeof sapObj.ui.getCore === 'function';
@@ -1363,7 +1390,8 @@ if (step.technology === 'WEBGUI') {
                         });
                     }
                     return isFound;
-                }, sel, { polling: 500, timeout: step.optional ? optionalTimeoutMs : 30000 }); // pasos optional → timeout corto
+                }, sel, { polling: 500, timeout: ms });
+                await waitWithMenuReopen(_waitRender, _opener, step.optional ? optionalTimeoutMs : 30000, (m) => console.log(`${T_SUB}${m}`)); // pasos optional → timeout corto
 
                 // Para un FILL sobre ComboBox/Select: esperar a que carguen los ITEMS (OData async)
                 // antes de casar el valor. Si no, getItems() está vacío → no hay match → el key no se
@@ -1531,6 +1559,8 @@ if (step.technology === 'WEBGUI') {
                             console.log(`${T_SUB}🔁 El menú de ${sel.controlType} se cerró solo tras el clic; se vuelve a abrir (${_r + 1}/2).`);
                             await _clickLoc.first().click({ force: true });
                         }
+                        // Y si se cierra más tarde, lo reabre la espera del paso siguiente (B13).
+                        if (_outcome.domId) _menuOpener = { loc: _clickLoc.first(), type: sel.controlType };
                     }
                     await page.evaluate(() => document.querySelectorAll('[data-fiori-click]').forEach(n => n.removeAttribute('data-fiori-click')));
                 }
