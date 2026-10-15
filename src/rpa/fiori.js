@@ -5,6 +5,7 @@
 // La versión CLI (recorder_play.js) es un wrapper delgado que lee un archivo y llama a esto.
 // ============================================================
 import { chromium } from '@playwright/test';
+import { waitForLogonOutcome, describeLogonFailure, LOGON_CODES } from './logon.js';
 
 // Reconstruye una URL completa forzando el origin + sap-client + sap-language del entorno destino.
 // Acepta URL relativa (formato plataforma) o absoluta (grabación raw): descarta cualquier
@@ -528,6 +529,7 @@ async function _execute(script, options) {
     // paso (login, arranque del launchpad, navegación), que es justo donde murió FORMS-0000001 y donde
     // el mensaje que llegaba a MIMO ('Timeout 30000ms exceeded') no decía nada del destino.
     let phase = 'startup';
+    let loggedIn = false;
 
     // --- Telemetría de progreso para la consola en vivo de MIMO (contrato onProgress) ---
     // El worker pasa options.onProgress y recoge los eventos (él asigna seq/at, buffea y hace flush).
@@ -626,7 +628,6 @@ async function _execute(script, options) {
 
     const browser = await chromium.launch({ headless, slowMo });
     const context = await browser.newContext({ ignoreHTTPSErrors: true, locale });
-    if (debug) await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
     // B8: ~35-45 s después de cada carga completa del FLP, el shell instancia en segundo plano las
     // tiles KPI de Smart Business del home (~300 en el job a37ac721: numeric, dual, contribution…,
     // cada una pidiendo su manifest y su fragmento). Durante ~50 s el hilo principal queda saturado:
@@ -720,25 +721,65 @@ async function _execute(script, options) {
         console.log("🔐 0. Ejecutando SAP Login →", BASE_LINK);
         emit({ level: 'INFO', done: 0, total: totalSteps, message: `Logging in to SAP (${username})…` });
         phase = `login SAP (${username} @ ${BASE_LINK})`;
-        await page.SAPLogin(username, password, BASE_LINK);
-
-        // Esta espera es TAMBIÉN la verificación del login: SAPLogin no comprueba que haya funcionado
-        // (tras el clic en Log On hace waitForNavigation/waitForLoadState dentro de un try/catch vacío,
-        // así que retorna igual si el servidor rechazó la contraseña). Que SAPUI5 arranque sí prueba
-        // que la sesión quedó establecida y el shell vivo.
+        // C4: el trace empieza DESPUÉS del login. Playwright graba los parámetros de cada acción
+        // (el `fill` del campo Password) y el cuerpo del POST de logon (`sap-password`), y las
+        // trazas se comparten entre equipos para diagnosticar: las dos que circularon llevaban la
+        // contraseña en claro. Una petición que termina con el trace ya abierto se graba con su
+        // cuerpo, así que se espera a que el POST de logon acabe; si no acaba, esta ejecución va
+        // sin trace. Un fallo de login ya llega explicado sin traza (C3, abajo).
         //
-        // Antes aquí había `waitForLoadState('networkidle')`, sin timeout propio ni catch: abortaba el
-        // job entero. Un launchpad Fiori real NUNCA da los ~500 ms de silencio de red que networkidle
-        // exige — en el lote FORMS-0000001 fueron 491 peticiones (281 fragmentos UI5, un tile de Smart
-        // Business cada uno) más el sondeo del servicio de notificaciones, y en el trace no hay una sola
-        // ventana de 500 ms de silencio ni a los ~78 s. Subir el timeout sólo convierte un fallo rápido
-        // en uno lento; Playwright marca `networkidle` como DISCOURAGED exactamente por esto y
-        // recomienda esperar una señal renderizada. Mismo criterio que la espera de arriveAtApp.
-        console.log("⏳ Esperando a que SAPUI5 arranque en el launchpad (señal de que el login aterrizó)...");
+        // Y no se espera a que SAPLogin retorne: tras el clic en Log On hace un waitForNavigation
+        // que empieza cuando la navegación ya ocurrió, y agota su plazo (job 700400c3: el POST
+        // respondió a los 14 s y SAPLogin siguió 23,9 s esperando; SAPUI5 ya estaba listo). En
+        // cuanto el POST termina, la página que SAP devuelve ya dice si entró o no. SAPLogin sigue
+        // en segundo plano; su espera se traga sus propios errores.
+        let logonPostDone;
+        const logonPostSettled = new Promise((resolve) => { logonPostDone = resolve; });
+        const isLogonPost = (req) => req.method() === 'POST' && /(^|&)sap-password=/.test(req.postData() || '');
+        const onLogonEnd = (req) => { if (isLogonPost(req)) logonPostDone(true); };
+        page.on('requestfinished', onLogonEnd);
+        page.on('requestfailed', onLogonEnd);
+        const loginRun = page.SAPLogin(username, password, BASE_LINK).then(() => null, (e) => e);
+        let loginError;
+        try {
+            loginError = await Promise.race([loginRun, logonPostSettled.then(() => null)]);
+            // SAPLogin retornó sin que se viera el POST terminar (navegación tragada a medias): no
+            // hay garantía de que el cuerpo no se grabe.
+            if (!loginError && debug) {
+                const settled = await Promise.race([logonPostSettled, page.waitForTimeout(30000).then(() => false)]);
+                if (settled) await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+                else console.warn("⚠️ El POST de logon no terminó en 30 s: esta ejecución va SIN trace para no grabar la contraseña.");
+            }
+        } finally {
+            page.off('requestfinished', onLogonEnd);
+            page.off('requestfailed', onLogonEnd);
+        }
+        if (loginError) throw loginError;
+
+        // C3: esta espera es TAMBIÉN la verificación del login. SAPLogin no comprueba que haya
+        // funcionado (tras el clic en Log On hace waitForNavigation/waitForLoadState dentro de un
+        // try/catch vacío). Antes sólo se esperaba a SAPUI5 y un rechazo tardaba 120 s en notarse,
+        // con un error que hablaba del launchpad. Ahora se resuelve en cuanto SAP pinta el rechazo,
+        // con un código en result.failure.code, y no se reintenta: cada intento fallido acerca el
+        // bloqueo del usuario en SAP. Detalle de la señal en logon.js.
+        //
+        // Que SAPUI5 arranque prueba que la sesión quedó establecida y el shell vivo. No se usa
+        // `networkidle`: un launchpad Fiori real NUNCA da ~500 ms de silencio de red (en el lote
+        // FORMS-0000001, 491 peticiones más el sondeo de notificaciones), y Playwright lo marca
+        // DISCOURAGED justo por esto. Mismo criterio que la espera de arriveAtApp.
+        console.log("⏳ Esperando el veredicto del login (launchpad vivo o rechazo de SAP)...");
         phase = `arranque del launchpad tras el login (${BASE_LINK})`;
-        await page.waitForFunction(() => !!(window.sap && sap.ui && (
-            typeof sap.ui.getCore === 'function' ? sap.ui.getCore() : (sap.ui.core && sap.ui.core.Element)
-        )), { timeout: 120000 });
+        const logon = await waitForLogonOutcome(page, { timeout: 120000 });
+        // Con LAUNCHPAD_TIMEOUT SAP sí aceptó el login: hay sesión que cerrar al final.
+        loggedIn = logon.ok || logon.code === LOGON_CODES.LAUNCHPAD_TIMEOUT;
+        if (!logon.ok) {
+            if (logon.code !== LOGON_CODES.LAUNCHPAD_TIMEOUT) phase = `login SAP (${username} @ ${BASE_LINK})`;
+            const err = new Error(logon.code === LOGON_CODES.LAUNCHPAD_TIMEOUT
+                ? `[${logon.code}] Timeout 120000ms: SAPUI5 no arrancó en el launchpad (el login no fue rechazado).`
+                : describeLogonFailure(logon, username));
+            err.logonCode = logon.code;
+            throw err;
+        }
         console.log("✅ Launchpad vivo: SAPUI5 cargado — la sesión SAP quedó establecida.");
         emit({ level: 'INFO', done: 0, total: totalSteps, message: `Launchpad ready at ${serverOrigin} (client ${sapClient}, user ${username}).` });
 
@@ -1694,7 +1735,8 @@ if (step.technology === 'WEBGUI') {
         emit({ level: 'ERROR', done: stepsDone, total: totalSteps, ...ctx(),
                step_no: current && current.stepIndex, action: current && current.action,
                message: `❌ Error (intent=${current?.intent ?? '?'}, step=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${detail}` });
-        result.failure = { ...(current || {}), phase, url: pageUrl || BASE_LINK, username, serverOrigin, sapClient, system: sapSystem, message: detail };
+        result.failure = { ...(current || {}), phase, url: pageUrl || BASE_LINK, username, serverOrigin, sapClient, system: sapSystem, message: detail,
+                           ...(error.logonCode ? { code: error.logonCode } : {}) };
         console.error(`\n❌ Error en la ejecución (intent=${current?.intent ?? '?'}, paso=${current?.stepIndex ?? '?'} ${current?.action ?? ''} ${current?.sid ?? ''}): ${detail}`);
     } finally {
         await waitPendingWrites('cerrar').catch(() => {});
@@ -1731,6 +1773,18 @@ if (step.technology === 'WEBGUI') {
             const tracePath = safeIid ? `trace-${safeIid}.zip` : 'trace.zip';
             console.log(`💾 Guardando el archivo de trace (${tracePath})...`);
             await context.tracing.stop({ path: tracePath }).catch(() => {});
+        }
+        // Cerrar la sesión en SAP antes de cerrar el navegador: si no, sigue viva en el servidor
+        // hasta que caduca, y su cookie (SAP_SESSIONID_…) viaja en el trace. Fuera del trace, que
+        // ya está guardado. Best-effort: el logout del shell (cierra también las sesiones WEBGUI)
+        // y, por si el shell no responde, el logoff del ICF, que termina la sesión de seguridad.
+        if (loggedIn) {
+            await Promise.race([
+                page.evaluate(() => window.sap?.ushell?.Container?.logout?.()).catch(() => {}),
+                page.waitForTimeout(10000).catch(() => {}),
+            ]);
+            await context.request.get(`${serverOrigin}/sap/public/bc/icf/logoff?sap-client=${sapClient}`, { timeout: 10000 })
+                .catch((e) => console.log(`⚠️ No se pudo cerrar la sesión SAP (${e.message}); caducará sola.`));
         }
         await browser.close().catch(() => {});
     }
