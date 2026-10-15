@@ -103,6 +103,12 @@ function firstVisible(candidates, timeout) {
 // Se mira que el overlay sea VISIBLE, no que exista: SAP deja nodos `.lsBlockLayer` ocultos en el
 // DOM, y comprobar sólo presencia haría que cada paso agotara el reloj entero.
 //
+// El fondo de un popup modal (`#urPopupWindowBlockLayer`) TAMBIÉN es un `.lsBlockLayer` visible,
+// y lo está todo el rato que el popup sigue abierto: SAP lo pone justo debajo del popup de arriba
+// (z-index del popup − 100). Contarlo como ocupado hacía que cada paso dentro de un popup agotara
+// el tope entero (corrida 700400c3: 31 esperas de 20 s, 603 s de 1420). Sólo cuenta un overlay que
+// tape también al popup de arriba (z-index ≥ el suyo), o cualquiera si no hay popup.
+//
 // Best-effort: si se agota, avisa y sigue. Nunca lanza ni convierte un paso en un fallo.
 // ============================================================
 const SETTLE_GRACE_MS    = 300;    // margen para que un overlay ya pedido llegue a aparecer
@@ -119,8 +125,12 @@ async function settleWebgui(frame, page) {
     while (Date.now() < deadline) {
         let busy;
         try {
-            busy = await frame.evaluate(() => [...document.querySelectorAll('.lsBlockLayer')]
-                .some(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }));
+            busy = await frame.evaluate(() => {
+                const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+                const z = (el) => parseInt(getComputedStyle(el).zIndex, 10) || 0;
+                const topPopup = Math.max(-Infinity, ...[...document.querySelectorAll('.lsPWNew')].filter(shown).map(z));
+                return [...document.querySelectorAll('.lsBlockLayer')].some(el => shown(el) && z(el) >= topPopup);
+            });
         } catch { return null; }
         if (busy) quiet = 0;
         else if (++quiet >= SETTLE_QUIET_POLLS) return true;
