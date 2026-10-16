@@ -34,3 +34,9 @@ con un usuario inexistente contra DS4, guardad el `data-sap-login` de esa págin
 `runFiori` de punta a punta contra un logon de SAP de mentira: el rechazo falla en segundos con su
 código y sin reintentar; el trace no contiene la contraseña (ni el `fill` ni el cuerpo del POST de
 logon, C4); y la sesión SAP se cierra al terminar.
+
+## `job-target.test.js`
+C1 del contrato MIMO fase 1 (`src/job-target.js`): el `server_origin` y el `sap_client` que trae el job
+tienen que coincidir con los del `config.json`; si no, el job se rechaza con `phase: 'system-check'`
+antes de abrir el navegador. El contrato pedía sólo avisar y usar el del job; se rechaza porque en esta
+fase las credenciales salen del config y no deben mandarse a otro host. Campos vacíos → se usa el config.

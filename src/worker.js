@@ -11,6 +11,7 @@ const notify    = require('./notify');
 const { createProgressReporter } = require('./progress');
 const { runFiori }  = require('./rpa/fiori');
 const runSapgui = require('./rpa/sapgui');
+const { checkJobTarget } = require('./job-target');
 
 const GETNEXTJOB_URL = `${config.server_url}/scheduler/v1/getNextJob`;
 
@@ -87,7 +88,8 @@ async function runJob(job) {
     }
 
     // Destino antes que nada: un job para otro sistema no llega a abrir el navegador.
-    const systemMismatch = checkJobSystem(job);
+    // Fase 1: el job trae también el servidor y el cliente; tienen que ser los del config (ver job-target.js).
+    const systemMismatch = checkJobSystem(job) || (rpa_type === 'fiori' ? checkJobTarget(job, config) : null);
     if (systemMismatch) {
         console.error(`[Worker] Job '${job_iid}' rechazado: ${systemMismatch}`);
         await notify(job_iid, 'FAILED', '', systemMismatch,

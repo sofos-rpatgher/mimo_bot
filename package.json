@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node test/progress-normalize.test.js && node test/logon.test.js",
+    "test": "node test/progress-normalize.test.js && node test/logon.test.js && node test/job-target.test.js",
     "test:rpa": "node test/webgui-frame.test.js && node test/logon-e2e.test.js"
   },
   "dependencies": {
