@@ -11,45 +11,12 @@ const notify    = require('./notify');
 const { createProgressReporter } = require('./progress');
 const { runFiori }  = require('./rpa/fiori');
 const runSapgui = require('./rpa/sapgui');
-const { checkJobTarget } = require('./job-target');
+const { checkJobFields, checkJobSystem, pinnedKeysFor, normOrigin } = require('./job-check');
 
 const GETNEXTJOB_URL = `${config.server_url}/scheduler/v1/getNextJob`;
 
 // One-job-at-a-time guard, shared across every trigger.
 let isRunning = false;
-
-// Etiqueta normalizada de un sistema SAP, para comparar sin depender de mayúsculas ni espacios.
-const normSystem = (v) => (v === null || v === undefined) ? '' : String(v).trim().toUpperCase();
-
-/**
- * Comprueba que el sistema SAP que declara el lote sea el que este bot tiene configurado.
- *
- * Hasta ahora el sistema del lote era decorativo: todas las opciones de conexión salen del
- * config.json local, y el job no transportaba el sistema — el lote FORMS-0000001 declaraba
- * 'SOFOS_DEMO' y la corrida fue contra Grupo Mar sin que nada lo advirtiera. El modo de fallo,
- * dicho claro: una acción real ejecutada en el SAP de otra empresa.
- *
- * En cuanto MIMO mande el sistema en el job, un job que no sea para este bot se rechaza ANTES de
- * abrir el navegador. Mientras no lo mande, se avisa y se sigue (comportamiento de hoy).
- *
- * @returns {string|null} el motivo del rechazo, o null si el job puede ejecutarse.
- */
-function checkJobSystem(job) {
-    const jobSystem = normSystem(job.sap_system ?? job.system_id ?? job.system);
-    const botSystem = normSystem(config.sap_system ?? config.system_id);
-
-    if (!jobSystem) {
-        console.warn(`[Worker] Job '${job.job_iid}' no declara sistema SAP — se ejecuta contra el destino del config.json (${config.serverOrigin}, client ${config.sapClient}).`);
-        return null;
-    }
-    if (!botSystem) {
-        return `El job declara el sistema SAP '${jobSystem}' pero este bot no tiene 'sap_system' en su config.json: no se puede verificar el destino. Define 'sap_system' con el sistema al que apunta ${config.serverOrigin}.`;
-    }
-    if (jobSystem !== botSystem) {
-        return `El job declara el sistema SAP '${jobSystem}' y este bot está configurado para '${botSystem}' (${config.serverOrigin}, client ${config.sapClient}). Se rechaza el job: ejecutarlo escribiría en el SAP equivocado.`;
-    }
-    return null;
-}
 
 /**
  * Asks the server for the next job to run.
@@ -87,17 +54,20 @@ async function runJob(job) {
         return;
     }
 
-    // Destino antes que nada: un job para otro sistema no llega a abrir el navegador.
-    // Fase 1: el job trae también el servidor y el cliente; tienen que ser los del config (ver job-target.js).
-    const systemMismatch = checkJobSystem(job) || (rpa_type === 'fiori' ? checkJobTarget(job, config) : null);
-    if (systemMismatch) {
-        console.error(`[Worker] Job '${job_iid}' rechazado: ${systemMismatch}`);
-        await notify(job_iid, 'FAILED', '', systemMismatch,
-                     JSON.stringify({ success: false, failure: { phase: 'system-check', message: systemMismatch } }));
+    // Destino y credenciales antes que nada: un job incompleto o de un sistema que este host no
+    // alcanza no llega a abrir el navegador. `rejected: true`: MIMO no lo cuenta como ejecución.
+    // Ver job-check.js. Nunca se registra el job entero: lleva sap_password.
+    const rejection = checkJobFields(job) || checkJobSystem(job, config);
+    if (rejection) {
+        console.error(`[Worker] Job '${job_iid}' rechazado (${rejection.phase}): ${rejection.message}`);
+        await notify(job_iid, 'FAILED', '', rejection.message, JSON.stringify({ success: false, failure: rejection }));
         return;
     }
 
-    console.log(`[Worker] Starting job '${job_iid}' (${rpa_type}) → ${config.serverOrigin} client ${config.sapClient}${config.sap_system ? ` [${config.sap_system}]` : ''}…`);
+    const target = rpa_type === 'fiori'
+        ? ` → ${normOrigin(job.server_origin)} client ${job.sap_client} user ${job.sap_user}`
+        : '';
+    console.log(`[Worker] Starting job '${job_iid}' (${rpa_type}) [${job.sap_system}]${target}…`);
 
     // Live execution trace: the RPA engine calls progress.onProgress as it runs.
     const progress = createProgressReporter(job_iid);
@@ -105,8 +75,21 @@ async function runJob(job) {
     let result;
     try {
         if (rpa_type === 'fiori') {
+            // Destino y credenciales, del job (fase 2); el resto de opciones (idioma, headless, debug…),
+            // del config. Lo que quede de destino o credenciales en un config antiguo no se usa.
             // jobIid: para que el trace.zip de esta corrida no pise el de la anterior.
-            result = await runFiori(parsed, { ...config, jobIid: job_iid, onProgress: progress.onProgress });
+            const { serverOrigin, sapClient, username, password, sap_system, sap_systems, tlsPinnedKeys, ...runOptions } = config;
+            result = await runFiori(parsed, {
+                ...runOptions,
+                serverOrigin : normOrigin(job.server_origin),
+                sapClient    : String(job.sap_client).trim(),
+                username     : job.sap_user,
+                password     : job.sap_password,
+                sap_system   : job.sap_system,
+                tlsPinnedKeys: pinnedKeysFor(job, config),
+                jobIid       : job_iid,
+                onProgress   : progress.onProgress,
+            });
         } else {
             result = await runSapgui(job_iid, parsed, batch_iid);
         }

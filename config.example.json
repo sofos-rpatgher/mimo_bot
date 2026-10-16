@@ -7,12 +7,9 @@
   "ngrok_url": "",
   "csharp_port": 5000,
 
-  "serverOrigin": "https://your-sap-host:44302",
-  "sap_system": "REQUIRED-name-of-the-SAP-system-this-serverOrigin-points-at",
-  "sapClient": 300,
+  "sap_systems": ["REQUIRED-ids-in-MIMO-of-the-SAP-systems-this-host-can-reach"],
+  "tlsPinnedKeys": {},
   "sapLanguage": "EN",
-  "username": "SAP_USER",
-  "password": "SAP_PASSWORD",
   "headless": true,
   "allowSave": true,
   "debug": true

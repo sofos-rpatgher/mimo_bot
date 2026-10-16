@@ -35,8 +35,16 @@ con un usuario inexistente contra DS4, guardad el `data-sap-login` de esa págin
 código y sin reintentar; el trace no contiene la contraseña (ni el `fill` ni el cuerpo del POST de
 logon, C4); y la sesión SAP se cierra al terminar.
 
-## `job-target.test.js`
-C1 del contrato MIMO fase 1 (`src/job-target.js`): el `server_origin` y el `sap_client` que trae el job
-tienen que coincidir con los del `config.json`; si no, el job se rechaza con `phase: 'system-check'`
-antes de abrir el navegador. El contrato pedía sólo avisar y usar el del job; se rechaza porque en esta
-fase las credenciales salen del config y no deben mandarse a otro host. Campos vacíos → se usa el config.
+## `job-check.test.js`
+C1 y C2 del contrato MIMO fase 2 (`src/job-check.js`): un job Fiori sin `sap_system`, `server_origin`,
+`sap_client`, `sap_user` o `sap_password` se rechaza con `phase: 'job-check'` y `rejected: true` antes de
+abrir el navegador (`sap_system` vacío, en cualquier job); un sistema que no está en `sap_systems` del
+config, con `phase: 'system-check'` y `rejected: true`. El `sap_system` de las fases 0 y 1 vale como lista
+de uno. Las huellas TLS (`tlsPinnedKeys`) se pasan sólo las del sistema del job. Sustituye a
+`job-target.test.js` (fase 1).
+
+## `tls-e2e.test.js` (`npm run test:rpa`, necesita navegador y `openssl`)
+C3 y C4 de la fase 2: `runFiori` contra un logon servido por HTTPS con un certificado de otro nombre
+(como el de SofOS). Sin huella, o con la de otro certificado, falla al conectar sin enviar el POST de
+logon; con la huella SPKI en `tlsPinnedKeys`, entra. La contraseña no aparece en la consola, el
+resultado, los eventos ni el trace.
