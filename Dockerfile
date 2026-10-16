@@ -17,6 +17,11 @@ RUN npm ci
 #    plus the OS libraries it needs to run headless on Debian.
 RUN npx playwright install --with-deps chromium
 
+# 2b) certutil, para que docker-entrypoint.sh añada a la base NSS de Chromium
+#     las CAs internas de los SAP que se monten en /app/certs (validación TLS, C3).
+RUN apt-get update && apt-get install -y --no-install-recommends libnss3-tools \
+    && rm -rf /var/lib/apt/lists/*
+
 # 3) Copy the application source.
 #    config.json is excluded via .dockerignore — provide it at runtime
 #    (bind mount) so secrets are never baked into the image.
@@ -25,4 +30,5 @@ COPY . .
 # The bot's HTTP server (config.port). The server reaches this for the /poll wake.
 EXPOSE 3001
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["node", "index.js"]

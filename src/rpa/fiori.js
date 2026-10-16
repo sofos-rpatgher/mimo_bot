@@ -636,8 +636,21 @@ async function _execute(script, options) {
 
     emit({ level: 'INFO', done: 0, total: totalSteps, message: `Starting execution: ${blocks.length} block(s), ${result.intentsTotal} intent(s), ${totalSteps} step(s).` });
 
-    const browser = await chromium.launch({ headless, slowMo });
-    const context = await browser.newContext({ ignoreHTTPSErrors: true, locale });
+    // C3 (contrato MIMO fase 2): el certificado del SAP se valida. Antes el contexto se creaba con
+    // ignoreHTTPSErrors, y cualquiera que se interpusiera en la red podía hacerse pasar por SAP y
+    // quedarse con la contraseña del POST de logon; con credenciales por usuario, no es aceptable.
+    //   · CA interna (p. ej. *.sap.grupomar.local): se instala en el almacén del host o de la
+    //     imagen Docker (docker-entrypoint.sh), una vez para todos los ambientes que firme.
+    //   · Certificado mal configurado (SofOS presenta uno de sdesk.sofoscorp.com en
+    //     web01.sofos.proatech.mx): su huella SPKI en `tlsPinnedKeys` del config, por sistema, como
+    //     excepción temporal hasta que Basis lo corrija. Chromium acepta entonces ESE certificado
+    //     (quien lo presente necesita su clave privada) y valida todos los demás. Llegan sólo las
+    //     del sistema del job: el navegador se lanza por job. Al renovarse con otra clave, el job
+    //     falla al conectar, antes de enviar la contraseña, hasta que se actualice la huella.
+    const tlsPinnedKeys = [].concat(options.tlsPinnedKeys || []).filter(Boolean);
+    const launchArgs = tlsPinnedKeys.length ? [`--ignore-certificate-errors-spki-list=${tlsPinnedKeys.join(',')}`] : [];
+    const browser = await chromium.launch({ headless, slowMo, args: launchArgs });
+    const context = await browser.newContext({ locale });
     // B8: ~35-45 s después de cada carga completa del FLP, el shell instancia en segundo plano las
     // tiles KPI de Smart Business del home (~300 en el job a37ac721: numeric, dual, contribution…,
     // cada una pidiendo su manifest y su fragmento). Durante ~50 s el hilo principal queda saturado:
@@ -749,7 +762,21 @@ async function _execute(script, options) {
         const onLogonEnd = (req) => { if (isLogonPost(req)) logonPostDone(true); };
         page.on('requestfinished', onLogonEnd);
         page.on('requestfailed', onLogonEnd);
-        const loginRun = page.SAPLogin(username, password, BASE_LINK).then(() => null, (e) => e);
+        // La primera navegación la hace el bot y no SAPLogin: SAPLogin envuelve todo en un catch que
+        // sustituye cualquier error por «Automatic SAP Login Failed», y un certificado rechazado
+        // tiene que llegar a MIMO como lo que es. Sin URL, SAPLogin rellena la página ya cargada.
+        try {
+            await page.goto(BASE_LINK, { timeout: 60000 });
+        } catch (e) {
+            const cert = /net::ERR_(CERT_\w+|SSL_\w+|BAD_SSL_\w+)/.exec(e.message);
+            if (!cert) throw e;
+            phase = `conexión TLS (${serverOrigin})`;
+            throw new Error(`Certificado TLS no válido en ${serverOrigin} (${cert[1]}). No se envía la contraseña. `
+                + `Si lo firma una CA interna, instaladla en el host del bot; si es un certificado mal configurado, `
+                + `fijad su huella SPKI en tlsPinnedKeys['${sapSystem || 'SISTEMA'}'] del config.json`
+                + `${tlsPinnedKeys.length ? ` (hay ${tlsPinnedKeys.length} fijada(s) para este sistema y no coinciden: ¿se renovó el certificado?)` : ''}.`);
+        }
+        const loginRun = page.SAPLogin(username, password).then(() => null, (e) => e);
         let loginError;
         try {
             loginError = await Promise.race([loginRun, logonPostSettled.then(() => null)]);
@@ -1788,12 +1815,13 @@ if (step.technology === 'WEBGUI') {
         // hasta que caduca, y su cookie (SAP_SESSIONID_…) viaja en el trace. Fuera del trace, que
         // ya está guardado. Best-effort: el logout del shell (cierra también las sesiones WEBGUI)
         // y, por si el shell no responde, el logoff del ICF, que termina la sesión de seguridad.
+        // Por el navegador y no con context.request: ese va por Node, no ve las huellas fijadas.
         if (loggedIn) {
             await Promise.race([
                 page.evaluate(() => window.sap?.ushell?.Container?.logout?.()).catch(() => {}),
                 page.waitForTimeout(10000).catch(() => {}),
             ]);
-            await context.request.get(`${serverOrigin}/sap/public/bc/icf/logoff?sap-client=${sapClient}`, { timeout: 10000 })
+            await page.goto(`${serverOrigin}/sap/public/bc/icf/logoff?sap-client=${sapClient}`, { timeout: 10000 })
                 .catch((e) => console.log(`⚠️ No se pudo cerrar la sesión SAP (${e.message}); caducará sola.`));
         }
         await browser.close().catch(() => {});
