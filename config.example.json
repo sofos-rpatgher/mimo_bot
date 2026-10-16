@@ -2,7 +2,6 @@
   "server_url": "http://MIMO_HOST:5005/odata/v4/CAPINCI100/mimo",
   "token": "change-me-to-a-secure-token",
   "name": "MimoBot-001",
-  "project_iid": "REQUIRED-set-this-so-the-bot-does-not-prompt",
   "ip_address": "http://THIS_BOT_HOST:3001",
   "port": 3001,
   "ngrok_url": "",
