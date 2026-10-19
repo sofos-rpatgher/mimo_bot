@@ -178,7 +178,7 @@ function sidLocator(scope, page, sid) {
 // estabilización y emparejamiento de SID, que es donde se han concentrado los tres últimos fallos
 // en producción. No forman parte de la API del módulo (runFiori) ni deben usarse desde el runner.
 export const __internals = { APP_DOC_URL, APP_IFRAME_CSS, appFrame, appScopes, firstVisible,
-                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator };
+                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup };
 
 // Serialización: encadena ejecuciones para que solo corra una sesión de navegador a la vez.
 let _fioriChain = Promise.resolve();
@@ -463,6 +463,39 @@ async function waitWithMenuReopen(waitFor, opener, totalMs, log) {
             }
         }
     }
+}
+
+// Orden y regla de completado de un grupo de `aggregated_intents` (contrato de correcciones, C1):
+// setup → items (para al primer fallo) → SIEMPRE finalize, salvo si falló el setup.
+//
+// Un item sólo cuenta como completo si el grupo SE GUARDÓ: su `finalize` y el settleWrites del grupo
+// terminaron bien. Antes se daba por completo al terminar sus pasos, y si el guardado del grupo fallaba
+// MIMO lo marcaba hecho, el complementario no lo repetía y el trabajo se perdía sin aviso.
+// Contrapartida conocida: en un grupo que guarda cada item al momento (el alta de tiles en el catálogo
+// WEBGUI), si falla el finalize, items que SÍ están en SAP se informan pendientes y el complementario
+// los repite («already exists»). Se prefiere eso a perder trabajo sin enterarse.
+//
+// hooks: stage(s) avisa de la fase (SETUP | ITEM | FINALIZE) para result.failure.group_stage;
+// setup(), item(item, idx) y finalize(itemError) ejecutan los pasos y lanzan si fallan.
+// Devuelve { done: [{ item, idx }], saved, error }: los items cuyos pasos terminaron, si el grupo se
+// guardó, y el error que hay que propagar (el del item si falló uno; si no, el del finalize).
+// Si falla el setup, lanza: no hay items que guardar.
+async function runAggregatedGroup(items, hooks) {
+    hooks.stage('SETUP');
+    await hooks.setup();
+    const done = [];
+    let error = null;
+    for (let k = 0; k < items.length; k++) {
+        hooks.stage('ITEM');
+        try { await hooks.item(items[k], k + 1); }
+        catch (e) { error = e; break; }
+        done.push({ item: items[k], idx: k + 1 });
+    }
+    if (!error) hooks.stage('FINALIZE');   // si falló un item, el failure sigue siendo del item
+    let saved = true;
+    try { await hooks.finalize(error); }
+    catch (e) { saved = false; if (!error) error = e; }
+    return { done, saved, error };
 }
 
 // Comparador por número de secuencia (block_seq, instruction_seq, instance_seq, intent_seq).
@@ -1707,49 +1740,56 @@ if (step.technology === 'WEBGUI') {
             } // fin INSTANCE
 
             // ── aggregated_intents (contrato): por cada grupo → navegar UNA vez → setup →
-            //    bucle de items SIN re-navegar → SIEMPRE finalize. Reportar cada item en cuanto
-            //    sus pasos terminan; ante un fallo, parar el bucle, correr finalize igual y
-            //    propagar (el `failure` apunta al item vía current.instance_iid).
+            //    bucle de items SIN re-navegar → SIEMPRE finalize. Los items cuentan como completos
+            //    sólo si el grupo se guardó (runAggregatedGroup). Ante un fallo de item, parar el
+            //    bucle, correr finalize igual y propagar (el `failure` apunta al item vía
+            //    current.instance_iid; `group_stage` dice en qué fase del grupo falló).
             for (const entry of [...(instr.aggregated_intents || [])].sort(bySeq('intent_seq'))) {
               const setup = entry.setup || [], items = entry.items || [], finalize = entry.finalize || [];
               const appLink = resolveUrl(entry.APP_LINK || BASE_LINK);
-              current = { block: block.block_id, instruction: instr.instruction_id, intent: entry.intent_id, group_key: entry.group_key, instance_iid: null, stepIndex: null, action: null, sid: null, message: null };
+              current = { block: block.block_id, instruction: instr.instruction_id, intent: entry.intent_id, group_key: entry.group_key, group_stage: null, instance_iid: null, stepIndex: null, action: null, sid: null, message: null };
               console.log(`  ┃  ┣━ AGGREGATED ${entry.intent_seq ?? '?'} · ${entry.intent_id || '?'} · grupo "${entry.group_key ?? '?'}"  (${items.length} items)`);
               // Navegar una sola vez. Detección WEBGUI a partir de los pasos de setup (o del 1er item).
               await arriveAtApp(appLink, setup.length ? setup : ((items[0] && items[0].code) || []));
-              // setup FUERA del try/finally: si falla, no hay items que persistir → no corras finalize.
-              if (setup.length) { console.log(`  ┃  ┃  ┣━ setup (${setup.length} pasos)`); await runStepList(setup); }
-              let _pendingErr = null;
-              let _itemIdx = 0; // índice 1-based del item dentro del grupo → "Instancia N" legible en la consola
-              try {
-                for (const item of items) {
-                  _itemIdx++;
+              const _ctxOf = (idx) => ({ block: block.block_id, instruction: instr.instruction_id, instance: idx, intent: entry.intent_id });
+              const { done: _done, saved: _saved, error: _groupErr } = await runAggregatedGroup(items, {
+                stage: (s) => { current.group_stage = s; },
+                setup: async () => { if (setup.length) { console.log(`  ┃  ┃  ┣━ setup (${setup.length} pasos)`); await runStepList(setup); } },
+                item: async (item, idx) => {
                   // instance = índice legible 1-based (para STEP/ERROR de este item); instance_iid = uuid
                   // (se conserva en result.failure para identificar exactamente el item que falló).
-                  current.instance = _itemIdx; current.instance_iid = item.instance_iid; current.stepIndex = null; current.action = null; current.sid = null;
+                  current.instance = idx; current.instance_iid = item.instance_iid; current.stepIndex = null; current.action = null; current.sid = null;
                   console.log(`  ┃  ┃  ┣━ item ${item.instance_iid ?? '?'}  (${(item.code || []).length} pasos)`);
                   // Línea de progreso de este item (misma `id` para started → STEP updates → completed).
-                  instCtx = { label: `Instance ${_itemIdx}`, total: (item.code || []).length || 1, done: 0 };
-                  emit({ level: 'INFO', percent: 0, done: stepsDone, total: totalSteps, block: block.block_id, instruction: instr.instruction_id, instance: _itemIdx, intent: entry.intent_id, message: `▶ Instance ${_itemIdx} — 0%` });
+                  instCtx = { label: `Instance ${idx}`, total: (item.code || []).length || 1, done: 0 };
+                  emit({ level: 'INFO', percent: 0, done: stepsDone, total: totalSteps, ..._ctxOf(idx), message: `▶ Instance ${idx} — 0%` });
                   try { await runStepList(item.code || []); await settleWrites('cerrar el item'); }
-                  catch (e) { _pendingErr = e; instCtx = null; break; }   // fallo de item → parar el bucle
+                  finally { instCtx = null; }   // salimos del item → los pasos de finalize no son de esta línea
+                },
+                finalize: async (itemErr) => {
+                  // finalize NO pertenece a ningún item: sus pasos no se agrupan bajo la línea del último.
+                  // Si falló un item, se conserva para que result.failure/ERROR lo señalen.
+                  if (!itemErr) { current.instance = null; current.instance_iid = null; }
+                  let _finErr = null;
+                  if (finalize.length) { try { console.log(`  ┃  ┃  ┗━ finalize (${finalize.length} pasos)`); await runStepList(finalize); } catch (e) { _finErr = e; } }
+                  try { await settleWrites('cerrar el grupo'); } catch (e) { _finErr = _finErr || e; }
+                  if (_finErr) throw _finErr;
+                },
+              });
+              // Hitos de cada item DESPUÉS del guardado (opción b de las correcciones): la consola no
+              // muestra un item al 100 % si su grupo no llegó a guardarse; en ese caso, un WARN por item.
+              for (const { item, idx } of _done) {
+                if (_saved) {
                   result.completedInstanceIids.push(item.instance_iid);
                   result.intentsCompleted++;
                   // The live console shows "Instance N" (readable index) instead of the item uuid.
-                  emit({ level: 'MILESTONE', percent: 100, done: stepsDone, total: totalSteps, block: block.block_id, instruction: instr.instruction_id, instance: _itemIdx, intent: entry.intent_id, message: `✓ Instance ${_itemIdx} — 100% completed (${result.intentsCompleted}/${result.intentsTotal})` });
-                  instCtx = null; // salimos del item → los pasos de finalize no son de esta línea
+                  emit({ level: 'MILESTONE', percent: 100, done: stepsDone, total: totalSteps, ..._ctxOf(idx), message: `✓ Instance ${idx} — 100% completed (${result.intentsCompleted}/${result.intentsTotal})` });
+                } else {
+                  emit({ level: 'WARN', done: stepsDone, total: totalSteps, ..._ctxOf(idx), message: `⚠ Instance ${idx} — steps done, but group "${entry.group_key ?? '?'}" was NOT saved: not completed` });
                 }
-              } finally {
-                // SIEMPRE finalize (persiste los items ya añadidos), incluso si un item falló.
-                // Limpiar el contexto de instancia: finalize NO pertenece a ningún item, así sus pasos
-                // no se agrupan bajo la línea del último item (si _pendingErr, conservamos el item que
-                // falló para que result.failure/ERROR lo señalen — no lo limpiamos en ese caso).
-                if (!_pendingErr) { current.instance = null; current.instance_iid = null; }
-                instCtx = null;
-                if (finalize.length) { try { console.log(`  ┃  ┃  ┗━ finalize (${finalize.length} pasos)`); await runStepList(finalize); } catch (e) { if (!_pendingErr) _pendingErr = e; } }
-                try { await settleWrites('cerrar el grupo'); } catch (e) { if (!_pendingErr) _pendingErr = e; }
               }
-              if (_pendingErr) throw _pendingErr;                   // propaga; current apunta al item fallido
+              if (!_saved && _done.length) console.log(`  ┃  ┃  ⚠️ El grupo "${entry.group_key ?? '?'}" no se guardó: ${_done.length} item(s) con los pasos terminados NO se informan completos.`);
+              if (_groupErr) throw _groupErr;   // propaga; current apunta al item fallido o al finalize
             }
             emit({ level: 'MILESTONE', done: stepsDone, total: totalSteps, block: block.block_id, instruction: instr.instruction_id, message: `✓ Instruction ${instr.instruction_id || '?'} finished` });
           } // fin INSTRUCTION

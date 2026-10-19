@@ -57,23 +57,46 @@ That's the whole win: one navigation for the whole group instead of one per item
 
 ## Completion reporting (drives complementary batches — important)
 
-Keep reporting `completedInstanceIids` as you do now, at the **item** level:
+`completedInstanceIids` is reported at the **item** level, but an item only counts as completed once
+its **group is saved** — that is, once `finalize` and the group's write settle finish without error
+(corrections contract, C1). Finishing an item's `code` steps is not enough: until the group is saved,
+SAP may hold nothing of it.
 
-- An item's `instance_iid` is reported **completed** once its `code` steps succeed.
-- On an item failure: **stop the loop**, still run `finalize`, and report the items that succeeded
-  **before** the failure. The failed item and everything after are *not* completed.
-- Because `finalize` always runs, the successful items are persisted (auto-save per item, or the
-  end-of-group Save), so re-running won't hit "already exists."
+| What fails | Items reported completed |
+|---|---|
+| Nothing | All items of the group |
+| `setup` | None (no items run, `finalize` is not run) |
+| Item *k* | Items before *k*, **only if** `finalize` (which still runs) succeeds; otherwise none |
+| `finalize` or its write settle | **None** of the group |
 
-Example: 60 tiles, tile 30 fails → tiles 1–29 reported completed, `finalize` runs, failure recorded
-at tile 30. Mimo's complementary batch then re-runs tiles 30–60 only. No special "atomic group"
-handling — per-item completion + always-finalize covers both auto-save and save-at-end intents.
+- On an item failure: **stop the loop**, still run `finalize`, then apply the table above. The failed
+  item and everything after are *not* completed.
+- `intentsCompleted` follows the same rule.
+
+Example: 60 tiles, tile 30 fails, `finalize` saves → tiles 1–29 reported completed, failure recorded at
+tile 30; Mimo's complementary batch re-runs tiles 30–60. If `finalize` had failed too, none of the 60
+would be reported, and the complementary batch re-runs the whole group.
+
+Known trade-off: a group whose items are saved one by one as they run (no save in `finalize`) still
+reports none completed if `finalize` fails, so the complementary batch re-runs items that are already
+in SAP and may hit "already exists". That is preferred to the alternative — work marked done that SAP
+never saved, which nobody would notice.
+
+### Live console
+
+An item's `MILESTONE` (`✓ Instance N — 100% completed`) is emitted only **after** its group is saved.
+If the group is not saved, each item whose steps finished gets a `WARN`
+(`⚠ Instance N — steps done, but group "…" was NOT saved: not completed`) on its own line, besides the
+`ERROR` of the failure.
 
 ## Failure object
 
 The `failure` you already return should point at the failing item — include its `instance_iid`
-(and the usual block/instruction/intent/step context) so mimo can locate it. Everything else about
-the `result` shape (`success`, `completedInstanceIids`, `failure`, `durationMs`) is unchanged.
+(and the usual block/instruction/intent/step context) so mimo can locate it. For a group it also
+carries `group_key` and **`group_stage`**: `SETUP`, `ITEM` or `FINALIZE` — where in the group it
+failed. When an item fails, `group_stage` stays `ITEM` even if `finalize` then fails too. When
+`finalize` fails, `instance` / `instance_iid` are `null` (it belongs to no item). Everything else
+about the `result` shape (`success`, `completedInstanceIids`, `failure`, `durationMs`) is unchanged.
 
 ## Summary of the executor's new job
 

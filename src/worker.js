@@ -108,11 +108,11 @@ async function runJob(job) {
 
     if (result.success) {
         console.log(`[Worker] Job '${job_iid}' completed (target: ${JSON.stringify(result.target ?? null)}).`);
-        await notify(job_iid, 'COMPLETED', '', '', result_json);
+        await notify(job_iid, 'COMPLETED', result.logs_url || '', '', result_json);
     } else {
         const msg = (result.failure && result.failure.message) || 'Unknown error';
         console.error(`[Worker] Job '${job_iid}' failed: ${msg}`);
-        await notify(job_iid, 'FAILED', '', msg, result_json);
+        await notify(job_iid, 'FAILED', result.logs_url || '', msg, result_json);
     }
 }
 
