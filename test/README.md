@@ -48,3 +48,15 @@ C3 y C4 de la fase 2: `runFiori` contra un logon servido por HTTPS con un certif
 (como el de SofOS). Sin huella, o con la de otro certificado, falla al conectar sin enviar el POST de
 logon; con la huella SPKI en `tlsPinnedKeys`, entra. La contraseña no aparece en la consola, el
 resultado, los eventos ni el trace.
+
+## `aggregated-group.test.js` y `aggregated-e2e.test.js` (este, en `npm run test:rpa`)
+C1 del contrato de correcciones: un item de un grupo de `aggregated_intents` sólo cuenta como completo
+si el grupo se guardó (`finalize` y el settle de escrituras del grupo terminan bien). El primero prueba
+la regla (`runAggregatedGroup`) con los escenarios del contrato; el segundo, `runFiori` de punta a punta:
+`completedInstanceIids`, `failure.group_stage`/`group_key` y los eventos (MILESTONE por item sólo tras
+guardar; WARN por item si el grupo no se guardó).
+
+## `sapgui-result.test.js`
+C2 del contrato de correcciones: `runSapgui` devuelve `{ success, failure?, logs_url,
+completedInstanceIids, resultReported }` como `runFiori` (antes devolvía el `logs_url` como cadena y todo
+job de SAP GUI acababa `FAILED`). Simula el servicio C# sustituyendo `fetch`. Necesita `config.json`.
