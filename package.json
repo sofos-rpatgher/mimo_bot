@@ -7,7 +7,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "test": "node test/progress-normalize.test.js && node test/logon.test.js && node test/job-check.test.js && node test/aggregated-group.test.js && node test/sapgui-result.test.js",
-    "test:rpa": "node test/webgui-frame.test.js && node test/logon-e2e.test.js && node test/tls-e2e.test.js && node test/aggregated-e2e.test.js"
+    "test:rpa": "node test/webgui-frame.test.js && node test/logon-e2e.test.js && node test/tls-e2e.test.js && node test/aggregated-e2e.test.js && node test/login-check-e2e.test.js"
   },
   "dependencies": {
     "@playwright/test": "npm:@playwright-sap/test@^1.1.6",

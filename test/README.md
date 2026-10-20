@@ -60,3 +60,10 @@ guardar; WARN por item si el grupo no se guardó).
 C2 del contrato de correcciones: `runSapgui` devuelve `{ success, failure?, logs_url,
 completedInstanceIids, resultReported }` como `runFiori` (antes devolvía el `logs_url` como cadena y todo
 job de SAP GUI acababa `FAILED`). Simula el servicio C# sustituyendo `fetch`. Necesita `config.json`.
+
+## `login-check-e2e.test.js` (`npm run test:rpa`, necesita navegador y `config.json`)
+Fase 2b: un job `login-check` por el worker (`runJob`), que sólo hace login y logout para verificar la
+contraseña de un usuario SAP. Contra un logon de mentira, con `fetch` sustituido para capturar los
+`notify`: contraseña buena → `COMPLETED` con logoff y sin abrir ninguna app; mala →
+`INVALID_CREDENTIALS` sin reintentos; sin `sap_password` → rechazo (`rejected: true`) sin tocar SAP; nada
+va al servicio de SAP GUI, no hay eventos de progreso ni trace, y la contraseña no aparece en ningún sitio.
