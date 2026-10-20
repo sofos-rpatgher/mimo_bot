@@ -111,6 +111,19 @@ n = notified('LC-EMPTY');
 ok(n[0]?.status_code === 'FAILED' && n[0].result?.failure?.rejected === true && n[0].result.failure.phase === 'job-check', 'FAILED con rejected: true (job-check)');
 ok(seen.paths.length === before, 'sin tocar el servidor SAP');
 
+console.log('\n== fase 2c · INSECURE sin permiso local ==');
+const before2 = seen.paths.length;
+const allowed = (config.allowInsecureTls || []).map((x) => String(x).toUpperCase());
+if (allowed.includes(String(system).toUpperCase())) {
+    console.log(`  · omitido: el config.json de esta máquina permite INSECURE para ${system}`);
+} else {
+    await runJob({ ...job('LC-INSECURE', GOOD), tls_mode: 'INSECURE', tls_pins: [] });
+    n = notified('LC-INSECURE');
+    ok(n[0]?.status_code === 'FAILED' && n[0].result?.failure?.rejected === true && /allowInsecureTls/.test(n[0].result.failure.message),
+       'FAILED con rejected: true, nombrando allowInsecureTls', n[0]?.result?.failure?.phase);
+    ok(seen.paths.length === before2, 'sin tocar el servidor SAP');
+}
+
 for (const k of Object.keys(orig)) console[k] = orig[k];
 
 console.log('\n== el resto ==');

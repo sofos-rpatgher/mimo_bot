@@ -9,6 +9,7 @@
 
   "sap_systems": ["REQUIRED-ids-in-MIMO-of-the-SAP-systems-this-host-can-reach"],
   "tlsPinnedKeys": {},
+  "allowInsecureTls": [],
   "sapLanguage": "EN",
   "headless": true,
   "allowSave": true,

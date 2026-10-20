@@ -539,6 +539,10 @@ async function _execute(script, options) {
     // Mismo login, misma validación TLS y mismo veredicto que un job normal; sin script, sin apps, sin
     // trace (no hay pasos que diagnosticar) y sin la limpieza de bloqueos del final (no se edita nada).
     const loginOnly    = !!options.loginOnly;
+    // Validación TLS (ver el bloque C3 junto a chromium.launch).
+    const tlsPinnedKeys = [].concat(options.tlsPinnedKeys || []).filter(Boolean);
+    const tlsMode      = ['VERIFY', 'PINNED', 'INSECURE'].includes(options.tlsMode) ? options.tlsMode : (tlsPinnedKeys.length ? 'PINNED' : 'VERIFY');
+    const tlsSource    = options.tlsSource === 'job' ? 'job' : 'config';
     const debug        = !!options.debug && !loginOnly;
     // Pasos marcados `optional:true` (p.ej. confirmar un prompt de transporte que SAP sólo muestra
     // condicionalmente) usan este timeout corto y, si el elemento no aparece, se OMITEN sin fallar
@@ -569,7 +573,7 @@ async function _execute(script, options) {
     // servidor, cliente, sistema y usuario se ejecutó realmente. El sistema que declara el lote es
     // sólo una intención; esto es el destino de verdad.
     const result = { success: false, intentsTotal: 0, intentsCompleted: 0, completedInstanceIids: [], failure: null, durationMs: 0,
-                     target: { system: sapSystem, serverOrigin, sapClient, sapLanguage, username: username || null } };
+                     target: { system: sapSystem, serverOrigin, sapClient, sapLanguage, username: username || null, tls_mode: tlsMode } };
     const startedAt = Date.now();
     let current = null; // contexto del paso en curso (para localizar el fallo)
     // Fase gruesa de la ejecución. `current` localiza el PASO; `phase` cubre lo que pasa fuera de un
@@ -684,10 +688,19 @@ async function _execute(script, options) {
     //     (quien lo presente necesita su clave privada) y valida todos los demás. Llegan sólo las
     //     del sistema del job: el navegador se lanza por job. Al renovarse con otra clave, el job
     //     falla al conectar, antes de enviar la contraseña, hasta que se actualice la huella.
-    const tlsPinnedKeys = [].concat(options.tlsPinnedKeys || []).filter(Boolean);
-    const launchArgs = tlsPinnedKeys.length ? [`--ignore-certificate-errors-spki-list=${tlsPinnedKeys.join(',')}`] : [];
+    //
+    // Fase 2c: el modo lo decide MIMO por sistema y llega en el job (el worker lo resuelve con
+    // resolveTls, que también aplica el permiso local de INSECURE): `tlsMode` VERIFY | PINNED |
+    // INSECURE, `tlsPinnedKeys` y `tlsSource` ('job' o 'config', para que el error apunte a donde se
+    // arregla). Sin `tlsMode` (llamadas directas), PINNED si hay huellas y si no VERIFY.
+    if (tlsMode === 'INSECURE') {
+        const msg = `Certificado no validado: SAP Systems → ${sapSystem || '?'} está en INSECURE en MIMO (permitido por allowInsecureTls del config.json).`;
+        console.warn(`⚠️ ${msg}`);
+        emit({ level: 'WARN', done: 0, total: totalSteps, message: msg });
+    }
+    const launchArgs = tlsMode === 'PINNED' ? [`--ignore-certificate-errors-spki-list=${tlsPinnedKeys.join(',')}`] : [];
     const browser = await chromium.launch({ headless, slowMo, args: launchArgs });
-    const context = await browser.newContext({ locale });
+    const context = await browser.newContext({ locale, ...(tlsMode === 'INSECURE' ? { ignoreHTTPSErrors: true } : {}) });
     // B8: ~35-45 s después de cada carga completa del FLP, el shell instancia en segundo plano las
     // tiles KPI de Smart Business del home (~300 en el job a37ac721: numeric, dual, contribution…,
     // cada una pidiendo su manifest y su fragmento). Durante ~50 s el hilo principal queda saturado:
@@ -808,10 +821,12 @@ async function _execute(script, options) {
             const cert = /net::ERR_(CERT_\w+|SSL_\w+|BAD_SSL_\w+)/.exec(e.message);
             if (!cert) throw e;
             phase = `conexión TLS (${serverOrigin})`;
-            throw new Error(`Certificado TLS no válido en ${serverOrigin} (${cert[1]}). No se envía la contraseña. `
-                + `Si lo firma una CA interna, instaladla en el host del bot; si es un certificado mal configurado, `
-                + `fijad su huella SPKI en tlsPinnedKeys['${sapSystem || 'SISTEMA'}'] del config.json`
-                + `${tlsPinnedKeys.length ? ` (hay ${tlsPinnedKeys.length} fijada(s) para este sistema y no coinciden: ¿se renovó el certificado?)` : ''}.`);
+            const renewed = tlsMode === 'PINNED' ? ` Hay ${tlsPinnedKeys.length} huella(s) fijada(s) y ninguna coincide: ¿se renovó el certificado?` : '';
+            const fix = tlsSource === 'job'
+                ? `Configurad TLS Certificate Validation de ${sapSystem || 'este sistema'} en MIMO (SAP Systems).`
+                : `Si lo firma una CA interna, instaladla en el host del bot; si es un certificado mal configurado, `
+                  + `fijad su huella SPKI en tlsPinnedKeys['${sapSystem || 'SISTEMA'}'] del config.json.`;
+            throw new Error(`Certificado TLS no válido en ${serverOrigin} (${cert[1]}). No se envía la contraseña. ${fix}${renewed}`);
         }
         const loginRun = page.SAPLogin(username, password).then(() => null, (e) => e);
         let loginError;

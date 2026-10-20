@@ -91,11 +91,72 @@ function checkJobSystem(job, cfg) {
     return null;
 }
 
-/** Las huellas TLS fijadas para el sistema del job (ver tlsPinnedKeys en fiori.js). */
+/** Las huellas TLS fijadas para el sistema del job en el config (ver resolveTls). */
 function pinnedKeysFor(job, cfg) {
     const pins = cfg.tlsPinnedKeys || {};
     const key = Object.keys(pins).find((k) => normSystem(k) === normSystem(job.sap_system));
     return key ? [].concat(pins[key]).filter((p) => !isBlank(p)) : [];
 }
 
-module.exports = { checkJobFields, checkJobSystem, reachableSystems, pinnedKeysFor, normOrigin, normSystem };
+// Una huella SPKI válida: SHA-256 (32 bytes) en base64 canónico. Cualquier otra cosa no llega a
+// Chromium: la lista va en un argumento de lanzamiento.
+function isValidPin(p) {
+    if (typeof p !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(p)) return false;
+    return Buffer.from(p, 'base64').length === 32;
+}
+
+const TLS_MODES = new Set(['VERIFY', 'PINNED', 'INSECURE']);
+
+/**
+ * Qué validación TLS aplicar a un job (contrato MIMO fase 2c).
+ *
+ * Desde la fase 2c la decide MIMO, por sistema, y viaja en el job: `tls_mode` (VERIFY | PINNED |
+ * INSECURE) y `tls_pins`. Lo que diga el job manda sobre `tlsPinnedKeys` del config, que sólo se usa
+ * si el job no trae `tls_mode` (un MIMO anterior a la fase 2c).
+ *
+ *   · Modo desconocido → VERIFY, con aviso. Nunca algo más permisivo.
+ *   · PINNED: las huellas que no son SHA-256 en base64 se descartan con aviso; si no queda ninguna,
+ *     el job se rechaza (`job-check`): es un error de configuración en MIMO y así no gasta un login.
+ *   · INSECURE: no validar el certificado devuelve el riesgo que quitó la fase 2 (quien esté en la
+ *     red entre el bot y SAP se queda con la contraseña), y bastaría un clic en MIMO para aplicarlo
+ *     a todos los bots. Así que sólo se acepta si el config de ESTE bot lo permite para ese sistema
+ *     (`allowInsecureTls: ["SOFOS_DEMO"]`), la misma última defensa local que `sap_systems`; si no,
+ *     el job se rechaza (`job-check`) sin enviar la contraseña.
+ *
+ * @returns {{ tls: { mode, pins, source, warnings } } | { rejection: object }}
+ */
+function resolveTls(job, cfg) {
+    const system = normSystem(job.sap_system);
+    const warnings = [];
+    if (isBlank(job.tls_mode)) {
+        const pins = pinnedKeysFor(job, cfg);
+        return { tls: { mode: pins.length ? 'PINNED' : 'VERIFY', pins, source: 'config', warnings } };
+    }
+    let mode = String(job.tls_mode).trim().toUpperCase();
+    if (!TLS_MODES.has(mode)) {
+        warnings.push(`tls_mode desconocido ('${job.tls_mode}') para ${system}: se valida el certificado normalmente (VERIFY).`);
+        mode = 'VERIFY';
+    }
+    if (mode === 'PINNED') {
+        const given = Array.isArray(job.tls_pins) ? job.tls_pins : [];
+        const pins = given.filter(isValidPin);
+        if (pins.length < given.length) warnings.push(`${given.length - pins.length} huella(s) de ${system} descartada(s): no son SHA-256 en base64.`);
+        if (!pins.length) {
+            return { rejection: rejection('job-check', `El sistema SAP '${system}' está en PINNED en MIMO pero el job no trae ninguna huella válida (SHA-256 en base64). `
+                + 'Se rechaza sin abrir el navegador; revisad TLS Certificate Validation del sistema en MIMO (SAP Systems).') };
+        }
+        return { tls: { mode, pins, source: 'job', warnings } };
+    }
+    if (mode === 'INSECURE') {
+        const allowed = (Array.isArray(cfg.allowInsecureTls) ? cfg.allowInsecureTls : []).map(normSystem);
+        if (!allowed.includes(system)) {
+            return { rejection: rejection('job-check', `El sistema SAP '${system}' está en INSECURE en MIMO (no validar el certificado), pero este bot no lo permite: `
+                + `falta '${system}' en allowInsecureTls de su config.json. Se rechaza sin enviar la contraseña. `
+                + 'Mejor que permitirlo: PINNED con la huella del certificado, o un certificado válido en SAP.') };
+        }
+        return { tls: { mode, pins: [], source: 'job', warnings } };
+    }
+    return { tls: { mode: 'VERIFY', pins: [], source: 'job', warnings } };
+}
+
+module.exports = { checkJobFields, checkJobSystem, reachableSystems, pinnedKeysFor, resolveTls, isValidPin, normOrigin, normSystem };
