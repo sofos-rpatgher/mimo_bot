@@ -535,7 +535,11 @@ async function _execute(script, options) {
     const slowMo       = options.slowMo    !== undefined ? options.slowMo    : 0;
     const allowSave    = options.allowSave !== undefined ? options.allowSave : true;
     const raw          = !!options.raw;
-    const debug        = !!options.debug;
+    // Fase 2b: sólo login y logout, para verificar la contraseña de un usuario SAP (job `login-check`).
+    // Mismo login, misma validación TLS y mismo veredicto que un job normal; sin script, sin apps, sin
+    // trace (no hay pasos que diagnosticar) y sin la limpieza de bloqueos del final (no se edita nada).
+    const loginOnly    = !!options.loginOnly;
+    const debug        = !!options.debug && !loginOnly;
     // Pasos marcados `optional:true` (p.ej. confirmar un prompt de transporte que SAP sólo muestra
     // condicionalmente) usan este timeout corto y, si el elemento no aparece, se OMITEN sin fallar
     // el intent. Un paso normal ausente sigue fallando con el timeout largo (60 s).
@@ -633,7 +637,7 @@ async function _execute(script, options) {
         console.log(`▶️  Modo --raw: 1 intent (${code.length} pasos).`);
     } else {
         blocks = jsonData.blocks || [];
-        if (blocks.length === 0) {
+        if (blocks.length === 0 && !loginOnly) {
             result.failure = { message: "El script multi-intent no contiene 'blocks' ejecutables." };
             result.durationMs = Date.now() - startedAt;
             return result;
@@ -1820,7 +1824,8 @@ if (step.technology === 'WEBGUI') {
         // 🔓 Liberar el lock de SAP: si quedamos en modo edición, salir con "Cancel"
         // (o "Discard") antes de cerrar. De lo contrario SAP retiene el enqueue lock
         // del catálogo y bloquea ejecuciones posteriores. Best-effort, no crítico.
-        try {
+        // En un login-check no se abrió ninguna app: no hay nada que soltar.
+        if (!loginOnly) try {
             const scopes = await appScopes(page);
             for (const label of ['Cancel', 'Discard', 'Discard Draft']) {
                 for (const scope of scopes) {

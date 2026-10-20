@@ -44,14 +44,19 @@ async function getNextJob() {
  */
 async function runJob(job) {
     const { job_iid, batch_iid, rpa_type, script } = job;
+    // Fase 2b: `login-check` sólo hace login y logout con el usuario del job, para verificar su
+    // contraseña. No trae batch ni script, y nunca va al servicio de SAP GUI.
+    const loginCheck = rpa_type === 'login-check';
 
-    let parsed;
-    try {
-        parsed = JSON.parse(script);
-    } catch {
-        console.error(`[Worker] Job '${job_iid}' has invalid script JSON.`);
-        await notify(job_iid, 'FAILED', '', 'Invalid script JSON.');
-        return;
+    let parsed = {};
+    if (!loginCheck) {
+        try {
+            parsed = JSON.parse(script);
+        } catch {
+            console.error(`[Worker] Job '${job_iid}' has invalid script JSON.`);
+            await notify(job_iid, 'FAILED', '', 'Invalid script JSON.');
+            return;
+        }
     }
 
     // Destino y credenciales antes que nada: un job incompleto o de un sistema que este host no
@@ -64,17 +69,19 @@ async function runJob(job) {
         return;
     }
 
-    const target = rpa_type === 'fiori'
+    const logsIn = rpa_type === 'fiori' || loginCheck;
+    const target = logsIn
         ? ` → ${normOrigin(job.server_origin)} client ${job.sap_client} user ${job.sap_user}`
         : '';
     console.log(`[Worker] Starting job '${job_iid}' (${rpa_type}) [${job.sap_system}]${target}…`);
 
-    // Live execution trace: the RPA engine calls progress.onProgress as it runs.
-    const progress = createProgressReporter(job_iid);
+    // Live execution trace: the RPA engine calls progress.onProgress as it runs. Un login-check no
+    // tiene pasos ni batch: no emite eventos.
+    const progress = loginCheck ? null : createProgressReporter(job_iid);
 
     let result;
     try {
-        if (rpa_type === 'fiori') {
+        if (logsIn) {
             // Destino y credenciales, del job (fase 2); el resto de opciones (idioma, headless, debug…),
             // del config. Lo que quede de destino o credenciales en un config antiguo no se usa.
             // jobIid: para que el trace.zip de esta corrida no pise el de la anterior.
@@ -88,21 +95,22 @@ async function runJob(job) {
                 sap_system   : job.sap_system,
                 tlsPinnedKeys: pinnedKeysFor(job, config),
                 jobIid       : job_iid,
-                onProgress   : progress.onProgress,
+                loginOnly    : loginCheck,
+                onProgress   : progress?.onProgress,
             });
         } else {
             result = await runSapgui(job_iid, parsed, batch_iid);
         }
     } catch (err) {
         // The RPA engine threw unexpectedly (crash) — no structured result.
-        await progress.close();   // flush whatever ran before the crash
+        await progress?.close();   // flush whatever ran before the crash
         console.error(`[Worker] Job '${job_iid}' crashed: ${err.message}`);
         const crash = JSON.stringify({ success: false, failure: { message: err.message } });
         await notify(job_iid, 'FAILED', '', err.message, crash);
         return;
     }
 
-    await progress.close();   // flush the final events before the terminal notify
+    await progress?.close();   // flush the final events before the terminal notify
 
     const result_json = JSON.stringify(result);
 
@@ -139,4 +147,4 @@ async function checkForWork() {
     }
 }
 
-module.exports = { checkForWork };
+module.exports = { checkForWork, runJob };   // runJob: para los tests

@@ -44,6 +44,16 @@ ok('job SAP GUI sin usuario ni contraseña → pasa', checkJobFields({ rpa_type:
 r = checkJobFields({ rpa_type: 'sapgui', sap_system: '' });
 ok('job SAP GUI sin sap_system → job-check (antes sólo avisaba)', r && r.phase === 'job-check', r && r.message);
 
+console.log('\n== fase 2b · login-check ==');
+const lc = (over) => job({ rpa_type: 'login-check', script: '', batch_iid: null, ...over });
+ok('login-check completo → pasa', checkJobFields(lc()) === null);
+r = checkJobFields(lc({ sap_password: '' }));
+ok('login-check sin sap_password → job-check, rejected: true', r && r.phase === 'job-check' && r.rejected === true && r.message.includes('sap_password'), r && r.message);
+r = checkJobFields(lc({ server_origin: '' }));
+ok('login-check sin server_origin → job-check', r && r.phase === 'job-check' && r.message.includes('server_origin'), r && r.message);
+r = checkJobSystem(lc({ sap_system: 'OTRO' }), { sap_systems: ['GRUPOMAR_DS4'] });
+ok('login-check de un sistema que el host no alcanza → system-check', r && r.phase === 'system-check' && r.rejected === true);
+
 console.log('\n== C2 · sistemas que alcanza el host ==');
 ok('sap_systems', reachableSystems({ sap_systems: ['grupomar_ds4', ' SOFOS_DEMO '] }).join() === 'GRUPOMAR_DS4,SOFOS_DEMO');
 ok('sap_system antiguo → lista de uno', reachableSystems({ sap_system: 'SOFOS_DEMO' }).join() === 'SOFOS_DEMO');

@@ -6,9 +6,9 @@
    quién: sap_system, server_origin, sap_client, sap_user y sap_password. El
    config.json ya no tiene destino ni credenciales. Así que:
 
-   · checkJobFields — un job Fiori al que le falte cualquiera de los cinco
-     campos se rechaza (`phase: 'job-check'`); y `sap_system` vacío, en
-     cualquier job. Antes, sin sistema se avisaba y se seguía contra el config;
+   · checkJobFields — un job Fiori o `login-check` (fase 2b) al que le falte
+     cualquiera de los cinco campos se rechaza (`phase: 'job-check'`); y
+     `sap_system` vacío, en cualquier job. Antes, sin sistema se avisaba y se seguía contra el config;
      ahora no hay config contra el que seguir.
    · checkJobSystem — el sistema del job tiene que estar en `sap_systems`, la
      lista de los que este host alcanza (`phase: 'system-check'`). MIMO ya sólo
@@ -44,20 +44,23 @@ const isBlank = (v) => v === null || v === undefined || String(v).trim() === '';
 
 const rejection = (phase, message) => ({ phase, rejected: true, message });
 
+// Tipos de job que hacen login en el launchpad con el usuario del job: necesitan destino y credenciales.
+const LOGS_IN = new Set(['fiori', 'login-check']);
+
 /**
  * @returns {object|null} el failure del rechazo, o null si el job trae lo que necesita.
  */
 function checkJobFields(job) {
     const missing = [];
     if (isBlank(job.sap_system)) missing.push('sap_system');
-    if (job.rpa_type === 'fiori') {
+    if (LOGS_IN.has(job.rpa_type)) {
         for (const f of ['server_origin', 'sap_client', 'sap_user', 'sap_password']) if (isBlank(job[f])) missing.push(f);
     }
     if (missing.length) {
         return rejection('job-check', `Job sin ${missing.join(', ')}: no se sabe a qué SAP conectarse o con quién. `
             + 'Se rechaza sin abrir el navegador; revisad el sistema y su usuario por defecto en MIMO.');
     }
-    if (job.rpa_type === 'fiori' && normOrigin(job.server_origin) === null) {
+    if (LOGS_IN.has(job.rpa_type) && normOrigin(job.server_origin) === null) {
         return rejection('job-check', `El job trae un server_origin que no es una URL http(s) ('${job.server_origin}'). `
             + 'Se rechaza sin abrir el navegador; revisad SAPSystems.fioriOrigin en MIMO.');
     }
