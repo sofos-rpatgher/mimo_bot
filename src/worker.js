@@ -11,7 +11,7 @@ const notify    = require('./notify');
 const { createProgressReporter } = require('./progress');
 const { runFiori }  = require('./rpa/fiori');
 const runSapgui = require('./rpa/sapgui');
-const { checkJobFields, checkJobSystem, pinnedKeysFor, normOrigin } = require('./job-check');
+const { checkJobFields, checkJobSystem, resolveTls, normOrigin } = require('./job-check');
 
 const GETNEXTJOB_URL = `${config.server_url}/scheduler/v1/getNextJob`;
 
@@ -62,14 +62,18 @@ async function runJob(job) {
     // Destino y credenciales antes que nada: un job incompleto o de un sistema que este host no
     // alcanza no llega a abrir el navegador. `rejected: true`: MIMO no lo cuenta como ejecución.
     // Ver job-check.js. Nunca se registra el job entero: lleva sap_password.
-    const rejection = checkJobFields(job) || checkJobSystem(job, config);
+    const logsIn = rpa_type === 'fiori' || loginCheck;
+    // Validación TLS del job (fase 2c): la decide MIMO por sistema; ver resolveTls.
+    const tlsDecision = logsIn ? resolveTls(job, config) : { tls: null };
+    const rejection = checkJobFields(job) || checkJobSystem(job, config) || tlsDecision.rejection;
     if (rejection) {
         console.error(`[Worker] Job '${job_iid}' rechazado (${rejection.phase}): ${rejection.message}`);
         await notify(job_iid, 'FAILED', '', rejection.message, JSON.stringify({ success: false, failure: rejection }));
         return;
     }
 
-    const logsIn = rpa_type === 'fiori' || loginCheck;
+    const tls = tlsDecision.tls;
+    for (const w of tls?.warnings || []) console.warn(`[Worker] Job '${job_iid}': ${w}`);
     const target = logsIn
         ? ` → ${normOrigin(job.server_origin)} client ${job.sap_client} user ${job.sap_user}`
         : '';
@@ -85,7 +89,7 @@ async function runJob(job) {
             // Destino y credenciales, del job (fase 2); el resto de opciones (idioma, headless, debug…),
             // del config. Lo que quede de destino o credenciales en un config antiguo no se usa.
             // jobIid: para que el trace.zip de esta corrida no pise el de la anterior.
-            const { serverOrigin, sapClient, username, password, sap_system, sap_systems, tlsPinnedKeys, ...runOptions } = config;
+            const { serverOrigin, sapClient, username, password, sap_system, sap_systems, tlsPinnedKeys, allowInsecureTls, ...runOptions } = config;
             result = await runFiori(parsed, {
                 ...runOptions,
                 serverOrigin : normOrigin(job.server_origin),
@@ -93,7 +97,9 @@ async function runJob(job) {
                 username     : job.sap_user,
                 password     : job.sap_password,
                 sap_system   : job.sap_system,
-                tlsPinnedKeys: pinnedKeysFor(job, config),
+                tlsMode      : tls.mode,
+                tlsPinnedKeys: tls.pins,
+                tlsSource    : tls.source,
                 jobIid       : job_iid,
                 loginOnly    : loginCheck,
                 onProgress   : progress?.onProgress,

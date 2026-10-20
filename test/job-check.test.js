@@ -73,6 +73,35 @@ ok('una sola como texto también vale', pinnedKeysFor(job({ sap_system: 'OTRO' }
 ok('las de otro sistema no se pasan', pinnedKeysFor(job(), pins).length === 0);
 ok('sin tlsPinnedKeys → ninguna', pinnedKeysFor(job(), {}).length === 0);
 
+console.log('\n== fase 2c · validación TLS del job ==');
+const { resolveTls, isValidPin } = require('../src/job-check');
+const PIN = 'M/DmJg+LDFCAwmIGT5hiJ86CvgwOOe0miBHQF7G4SyY=';
+const sofos = (over) => job({ sap_system: 'SOFOS_DEMO', ...over });
+const cfgPins = { tlsPinnedKeys: { SOFOS_DEMO: ['AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='] } };
+ok('huella válida: SHA-256 en base64', isValidPin(PIN) && !isValidPin('xyz=') && !isValidPin(PIN + ',--x') && !isValidPin(PIN.slice(0, -1)));
+let t = resolveTls(sofos({ tls_mode: 'PINNED', tls_pins: [PIN] }), cfgPins).tls;
+ok('PINNED del job: sus huellas, no las del config', t.mode === 'PINNED' && t.pins.join() === PIN && t.source === 'job');
+t = resolveTls(sofos({ tls_mode: 'VERIFY', tls_pins: [] }), cfgPins).tls;
+ok('VERIFY del job manda sobre tlsPinnedKeys del config', t.mode === 'VERIFY' && t.pins.length === 0 && t.source === 'job');
+t = resolveTls(sofos({}), cfgPins).tls;
+ok('sin tls_mode (MIMO anterior) → tlsPinnedKeys del config', t.mode === 'PINNED' && t.pins.length === 1 && t.source === 'config');
+t = resolveTls(job({}), {}).tls;
+ok('sin tls_mode ni huellas en el config → VERIFY', t.mode === 'VERIFY' && t.source === 'config');
+t = resolveTls(sofos({ tls_mode: 'pinned', tls_pins: [PIN, 'basura', ''] }), {}).tls;
+ok('minúsculas valen; huellas inválidas descartadas con aviso', t.mode === 'PINNED' && t.pins.length === 1 && t.warnings.length === 1, t.warnings[0]);
+r = resolveTls(sofos({ tls_mode: 'PINNED', tls_pins: ['basura'] }), {}).rejection;
+ok('PINNED sin ninguna huella válida → job-check, rejected: true', r && r.phase === 'job-check' && r.rejected === true, r && r.message);
+r = resolveTls(sofos({ tls_mode: 'PINNED' }), {}).rejection;
+ok('PINNED sin tls_pins → job-check', r && r.phase === 'job-check');
+t = resolveTls(sofos({ tls_mode: 'LAXO' }), {}).tls;
+ok('modo desconocido → VERIFY con aviso, nunca más permisivo', t.mode === 'VERIFY' && t.warnings.length === 1, t.warnings[0]);
+r = resolveTls(sofos({ tls_mode: 'INSECURE', tls_pins: [] }), {}).rejection;
+ok('INSECURE sin permiso local → job-check, rejected: true', r && r.phase === 'job-check' && r.rejected === true && r.message.includes('allowInsecureTls'), r && r.message);
+r = resolveTls(sofos({ tls_mode: 'INSECURE' }), { allowInsecureTls: ['GRUPOMAR_DS4'] }).rejection;
+ok('INSECURE permitido para OTRO sistema → rechazado', !!r);
+t = resolveTls(sofos({ tls_mode: 'INSECURE' }), { allowInsecureTls: ['sofos_demo'] }).tls;
+ok('INSECURE con permiso local para ese sistema → INSECURE', t && t.mode === 'INSECURE');
+
 console.log('\n== normalización del destino ==');
 ok('barra final, mayúsculas y puerto 443 explícito', normOrigin('HTTPS://Host.Example:443/') === 'https://host.example');
 

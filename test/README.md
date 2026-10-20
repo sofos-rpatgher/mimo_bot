@@ -67,3 +67,9 @@ contraseña de un usuario SAP. Contra un logon de mentira, con `fetch` sustituid
 `notify`: contraseña buena → `COMPLETED` con logoff y sin abrir ninguna app; mala →
 `INVALID_CREDENTIALS` sin reintentos; sin `sap_password` → rechazo (`rejected: true`) sin tocar SAP; nada
 va al servicio de SAP GUI, no hay eventos de progreso ni trace, y la contraseña no aparece en ningún sitio.
+
+Fase 2c (en `job-check.test.js` y `tls-e2e.test.js`): la validación TLS viaja en el job (`tls_mode`
+VERIFY | PINNED | INSECURE, `tls_pins`) y manda sobre `tlsPinnedKeys` del config, que sólo se usa si el
+job no trae `tls_mode`. Modo desconocido → VERIFY; PINNED sin huellas válidas → rechazo `job-check`;
+INSECURE sólo si `allowInsecureTls` del config lo permite para ese sistema (si no, rechazo `job-check`),
+con aviso en el log y evento WARN. El error de certificado apunta a *SAP Systems* en MIMO.
