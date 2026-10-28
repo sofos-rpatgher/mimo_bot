@@ -178,7 +178,7 @@ function sidLocator(scope, page, sid) {
 // estabilización y emparejamiento de SID, que es donde se han concentrado los tres últimos fallos
 // en producción. No forman parte de la API del módulo (runFiori) ni deben usarse desde el runner.
 export const __internals = { APP_DOC_URL, APP_IFRAME_CSS, appFrame, appScopes, firstVisible,
-                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup };
+                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup, isWriteRequest };
 
 // Serialización: encadena ejecuciones para que solo corra una sesión de navegador a la vez.
 let _fioriChain = Promise.resolve();
@@ -498,6 +498,27 @@ async function runAggregatedGroup(items, hooks) {
     return { done, saved, error };
 }
 
+// B14: ¿es una escritura? Un $batch de OData siempre va por POST, lleve escrituras o sólo lecturas.
+// Antes todo POST contaba, y la app de SAP cancela sus propios listados en $batch (GET pageSet,
+// GET catalogSet, con `sap-cancel-on-close`) cada vez que se escribe en un campo de búsqueda: el
+// bot los daba por «escrituras sin confirmar» y fallaba el intent aunque la escritura de verdad
+// hubiera respondido 201 (job 8b209885, FORMS-0000005). Ahora un $batch sólo cuenta si lleva un
+// changeset (`multipart/mixed` dentro del cuerpo) o alguna petición con método de escritura (OData
+// V4 admite escrituras fuera de changeset); en un $batch JSON de V4, si alguna petición no es GET.
+// Sin cuerpo legible, se trata como escritura: ante la duda, esperar y vigilar.
+function isWriteRequest(method, url, body, contentType) {
+    if (/^(GET|HEAD|OPTIONS)$/i.test(method || '')) return false;
+    if (!/\/\$batch(\?|$)/.test(String(url || '').split('#')[0])) return true;
+    if (!body) return true;
+    if (/application\/json/i.test(contentType || '')) {
+        try {
+            const reqs = JSON.parse(body).requests;
+            return !Array.isArray(reqs) || reqs.some((q) => !/^GET$/i.test((q && q.method) || ''));
+        } catch { return true; }
+    }
+    return /multipart\/mixed/i.test(body) || /^(POST|PUT|MERGE|PATCH|DELETE) /m.test(body);
+}
+
 // Comparador por número de secuencia (block_seq, instruction_seq, instance_seq, intent_seq).
 // La jerarquía multi-intent se recorre anidada (block → instruction → instance → intent),
 // con logs por nivel para trazabilidad y futuro manejo de errores por paso.
@@ -728,18 +749,26 @@ async function _execute(script, options) {
     // rechazó alguna) y, como red de seguridad, antes de navegar o cerrar el navegador.
     const _pendingWrites = new Set();
     const _writeErrors = [];
-    const _isWrite = (r) => !/^(GET|HEAD|OPTIONS)$/i.test(r.method());
-    page.on('request', (r) => { if (_isWrite(r)) _pendingWrites.add(r); });
+    // La clasificación (B14, isWriteRequest) se hace UNA vez, al salir la petición: un $batch de
+    // sólo lecturas no entra en _pendingWrites, así que ni se le espera ni su cancelación cuenta.
+    page.on('request', (r) => {
+        let write = true;
+        try { write = isWriteRequest(r.method(), r.url(), r.postData(), (r.headers() || {})['content-type']); }
+        catch { /* ante la duda, escritura */ }
+        if (write) _pendingWrites.add(r);
+    });
     page.on('requestfinished', async (r) => {
+        if (!_pendingWrites.has(r)) return;
         // La petición sigue "pendiente" hasta haber leído su respuesta: así settleWrites no puede
         // adelantarse a la inspección.
-        try { if (_isWrite(r) && /\/sap\/opu\//.test(r.url())) { const err = await odataWriteError(r); if (err) _writeErrors.push(err); } }
+        try { if (/\/sap\/opu\//.test(r.url())) { const err = await odataWriteError(r); if (err) _writeErrors.push(err); } }
         catch { /* inspección best-effort: nunca rompe la ejecución */ }
         finally { _pendingWrites.delete(r); }
     });
     page.on('requestfailed', (r) => {
         // Una escritura OData que muere sin respuesta (red, o cancelada por una navegación) no dice
-        // si SAP la aplicó: cuenta como no confirmada.
+        // si SAP la aplicó: cuenta como no confirmada (B10, job 0b12b73c). Sólo escrituras: un
+        // listado que la app cancela no entra aquí (B14).
         if (_pendingWrites.delete(r) && /\/sap\/opu\//.test(r.url()))
             _writeErrors.push(`${r.method()} ${r.url().split('?')[0].replace(/^.*\/sap\/opu\/odata4?\//, '')} → sin respuesta (${(r.failure() || {}).errorText || 'cancelada'})`);
     });
