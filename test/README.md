@@ -73,3 +73,11 @@ VERIFY | PINNED | INSECURE, `tls_pins`) y manda sobre `tlsPinnedKeys` del config
 job no trae `tls_mode`. Modo desconocido → VERIFY; PINNED sin huellas válidas → rechazo `job-check`;
 INSECURE sólo si `allowInsecureTls` del config lo permite para ese sistema (si no, rechazo `job-check`),
 con aviso en el log y evento WARN. El error de certificado apunta a *SAP Systems* en MIMO.
+
+## `write-detection.test.js` y `write-detection-e2e.test.js` (este, en `npm run test:rpa`)
+B14: qué cuenta como escritura OData para la vigilancia de escrituras (B10/B12). Un `$batch` siempre es
+`POST`; sólo cuenta si lleva un changeset o una petición con método de escritura (o, en un `$batch` JSON
+de V4, alguna que no sea `GET`). El primero prueba la clasificación con los cuerpos literales del job
+8b209885 (FORMS-0000005), cuyos listados cancelados por el buscador el bot daba por «escrituras sin
+confirmar». El segundo reproduce ese job con `runFiori` (listado cancelado + escritura con 201 → el
+intent termina bien) y comprueba que una escritura cancelada sigue haciendo fallar el intent (B10).
