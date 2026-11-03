@@ -178,7 +178,8 @@ function sidLocator(scope, page, sid) {
 // estabilización y emparejamiento de SID, que es donde se han concentrado los tres últimos fallos
 // en producción. No forman parte de la API del módulo (runFiori) ni deben usarse desde el runner.
 export const __internals = { APP_DOC_URL, APP_IFRAME_CSS, appFrame, appScopes, firstVisible,
-                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup, isWriteRequest };
+                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup, isWriteRequest,
+                             isBootResource, describeBootLoad };
 
 // Serialización: encadena ejecuciones para que solo corra una sesión de navegador a la vez.
 let _fioriChain = Promise.resolve();
@@ -519,6 +520,25 @@ function isWriteRequest(method, url, body, contentType) {
     return /multipart\/mixed/i.test(body) || /^(POST|PUT|MERGE|PATCH|DELETE) /m.test(body);
 }
 
+// B15: ¿la app sigue llegando? Job cbe25b0b: tras una recarga limpia, el arranque de UI5 tardó diez
+// veces lo normal (core-ext-light-0 13,9 s, unified/library-preload 24 s, ShellBar/Component-preload
+// sin terminar a los 40 s) y el paso agotó sus 30 s con «sap.m.Button: total=0», que parece una app
+// ausente y era una app en tránsito. Cuenta como arranque el código y los recursos de la app (.js,
+// .json, .properties), nunca OData ni el sondeo del shell, que no se callan nunca.
+function isBootResource(url) {
+    const u = String(url || '').split(/[?#]/)[0];
+    return !/\/sap\/opu\//.test(u) && /\.(js|json|properties)$/i.test(u);
+}
+
+// Para los diagnósticos: estado del documento y lo que sigue bajando, con el fichero más antiguo.
+function describeBootLoad({ readyState, pending }) {
+    const head = `carga: readyState=${readyState || '?'}`;
+    if (!pending.length) return `${head}, nada pendiente`;
+    const oldest = pending.reduce((a, b) => (b.ageMs > a.ageMs ? b : a));
+    const name = oldest.url.split(/[?#]/)[0].split('/').slice(-2).join('/');
+    return `${head}, ${pending.length} fichero(s) de arranque pendiente(s), el más antiguo ${name} (${Math.round(oldest.ageMs / 1000)} s)`;
+}
+
 // Comparador por número de secuencia (block_seq, instruction_seq, instance_seq, intent_seq).
 // La jerarquía multi-intent se recorre anidada (block → instruction → instance → intent),
 // con logs por nivel para trazabilidad y futuro manejo de errores por paso.
@@ -569,6 +589,9 @@ async function _execute(script, options) {
     // condicionalmente) usan este timeout corto y, si el elemento no aparece, se OMITEN sin fallar
     // el intent. Un paso normal ausente sigue fallando con el timeout largo (60 s).
     const optionalTimeoutMs = options.optionalTimeoutMs || 8000;
+    // B15: techo de la espera de arranque de una app mientras su código siga llegando. La opción
+    // existe para los tests; en producción vale el valor por defecto.
+    const BOOT_CEILING_MS = options.bootCeilingMs || 120000;
     // Tiles KPI de Smart Business: bloqueadas por defecto (ver el page.route más abajo). Se cargan
     // con `blockKpiTiles: false` o MIMO_LOAD_KPI_TILES=1.
     const blockKpiTiles = options.blockKpiTiles !== undefined ? !!options.blockKpiTiles : process.env.MIMO_LOAD_KPI_TILES !== '1';
@@ -773,6 +796,18 @@ async function _execute(script, options) {
             _writeErrors.push(`${r.method()} ${r.url().split('?')[0].replace(/^.*\/sap\/opu\/odata4?\//, '')} → sin respuesta (${(r.failure() || {}).errorText || 'cancelada'})`);
     });
 
+    // B15: ficheros de arranque en vuelo (isBootResource). Una navegación cancela los pendientes del
+    // documento anterior (requestfailed), así que el mapa sólo describe el documento actual.
+    const _bootLoads = new Map();
+    page.on('request', (r) => { if (isBootResource(r.url())) _bootLoads.set(r, Date.now()); });
+    page.on('requestfinished', (r) => { _bootLoads.delete(r); });
+    page.on('requestfailed', (r) => { _bootLoads.delete(r); });
+    async function bootLoad() {
+        const readyState = await page.evaluate(() => document.readyState).catch(() => '?');
+        const now = Date.now();
+        return { readyState, pending: [..._bootLoads].map(([r, t]) => ({ url: r.url(), ageMs: now - t })) };
+    }
+
     // B12: ¿rechazó SAP la escritura? Un $batch responde 202 aunque su changeset haya fallado: el
     // error va DENTRO, en la parte del changeset. Sólo cuentan los changesets (las escrituras); una
     // lectura que falle dentro del mismo batch no hace fallar el intent.
@@ -905,6 +940,20 @@ async function _execute(script, options) {
         // ── Helpers reutilizables (intents normales Y aggregated_intents) ──────────────
         // arriveAtApp: navega a la app (con la lógica WEBGUI/same-app), detecta el entorno
         // y engancha el force-same-tab. runStepList: ejecuta una lista de pasos SIN navegar.
+        // B15: el page.goto de playwright-sap espera ADEMÁS a 'load' (30 s, ignora waitUntil), así que
+        // un arranque lento rompía la navegación aunque el documento ya estuviera. Si el documento llegó
+        // y su código sigue bajando, se sigue: la espera de SAPUI5 y watchAppStart deciden. Cualquier
+        // otro fallo de navegación sigue siendo fallo.
+        async function gotoApp(appLink) {
+            try {
+                await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            } catch (e) {
+                if (!/Timeout/.test(e.message || '') || page.url() === 'about:blank') throw e;
+                const _load = await bootLoad();
+                if (!_load.pending.length) throw e;
+                console.log(`  ┃  ┃  ┃  ⏳ La página no terminó de cargar en 30 s, pero sigue llegando (${describeBootLoad(_load)}); se sigue esperando a SAPUI5.`);
+            }
+        }
         async function arriveAtAppOnce(appLink, steps, forceReload) {
                 await waitPendingWrites('navegar');
                 phase = `navegación a la app (${appLink})`;
@@ -925,7 +974,7 @@ async function _execute(script, options) {
                 if (forceReload) {
                     console.log(`  ┃  ┃  ┃  🔁 reintento tras caída de la app → recarga limpia (about:blank + goto)`);
                     await page.goto('about:blank').catch(() => {});
-                    await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    await gotoApp(appLink);
                 } else if (_fromWebgui || _toWebgui) {
                     if (_fromWebgui) {
                         // Antes de DESTRUIR la iframe WEBGUI de origen, esperar a que termine su último
@@ -943,7 +992,7 @@ async function _execute(script, options) {
                     }
                     console.log(`  ┃  ┃  ┃  🔁 transición con app WEBGUI (${_fromWebgui ? 'origen' : ''}${_fromWebgui && _toWebgui ? '+' : ''}${_toWebgui ? 'destino' : ''}) → recarga completa`);
                     await page.goto('about:blank').catch(() => {});
-                    await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    await gotoApp(appLink);
                 } else {
                     // UI5→UI5. Un page.goto que sólo cambia el hash es navegación same-document y NO
                     // recarga; falla de dos formas:
@@ -964,22 +1013,39 @@ async function _execute(script, options) {
                     if (_sameApp || _curDeep) {
                         console.log(`  ┃  ┃  ┃  🔁 ${_sameApp ? 're-entrada a la misma app' : 'saliendo de una sub-ruta (editor/detalle)'} → recarga limpia (about:blank + goto)`);
                         await page.goto('about:blank').catch(() => {});
-                        await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                        await gotoApp(appLink);
                     } else {
                         // `domcontentloaded`, igual que las otras dos ramas de arriveAtApp: el shell Fiori
                         // mantiene la red viva, así que 'networkidle' aquí se agota siempre y aborta el
                         // primer intent que navegue por este camino. La comprobación de verdad es el
                         // waitForFunction de SAPUI5 que viene inmediatamente después.
-                        await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                        await gotoApp(appLink);
                     }
                 }
 
-        // Esperamos a que la base de SAPUI5 esté cargada en memoria
-        await page.waitForFunction(() => {
-            if (!window.sap || !sap.ui) return false;
-            if (typeof sap.ui.getCore === 'function') return !!sap.ui.getCore();
-            return !!(sap.ui.core && sap.ui.core.Element);
-        }, { timeout: 30000 });
+        // Esperamos a que la base de SAPUI5 esté cargada en memoria. 30 s, prorrogables hasta
+        // BOOT_CEILING_MS mientras siga bajando el arranque (B15).
+        {
+            const _t0 = Date.now();
+            for (;;) {
+                try {
+                    await page.waitForFunction(() => {
+                        if (!window.sap || !sap.ui) return false;
+                        if (typeof sap.ui.getCore === 'function') return !!sap.ui.getCore();
+                        return !!(sap.ui.core && sap.ui.core.Element);
+                    }, { timeout: Math.min(30000, Math.max(1000, BOOT_CEILING_MS - (Date.now() - _t0))) });
+                    break;
+                } catch (e) {
+                    const _load = await bootLoad();
+                    if (_load.pending.length && Date.now() - _t0 < BOOT_CEILING_MS) {
+                        console.log(T_ENV + `⏳ SAPUI5 aún no arranca, pero sigue llegando (${describeBootLoad(_load)}); se espera más.`);
+                        continue;
+                    }
+                    e.message += ` · ${describeBootLoad(_load)}`;
+                    throw e;
+                }
+            }
+        }
         console.log(T_ENV + "✅ Entorno Base SAPUI5 detectado. Iniciando ejecución híbrida...");
         phase = `ejecución de pasos (${appLink})`;
 
@@ -1159,10 +1225,24 @@ async function _execute(script, options) {
         // Tras navegar se vigila hasta 10 s: contenedor de la app pintado → ok; página de error
         // o excepción no capturada → recarga limpia UNA vez. Si vuelve a caer, sólo se avisa: el
         // paso fallará con su propio DIAG.
+        //
+        // B15: pasados esos 10 s sin contenedor, si el arranque sigue bajando (job cbe25b0b: 40 s tras
+        // la recarga) se sigue esperando, hasta BOOT_CEILING_MS. Agotado el techo con ficheros aún en
+        // vuelo, es un arranque atascado y cuenta como caída: recarga limpia UNA vez. Sin contenedor
+        // pero sin nada bajando se sigue como antes (hay apps cuyo contenedor no se reconoce).
         async function watchAppStart(appLink, errs) {
             const _tgt = (appLink.includes('#') ? appLink.slice(appLink.indexOf('#') + 1) : '').split(/[&\/?]/)[0];
-            const _deadline = Date.now() + (_tgt ? 10000 : 2000);   // sin hash no hay contenedor que esperar
-            while (Date.now() < _deadline) {
+            const _t0 = Date.now();
+            const _quiet = _t0 + (_tgt ? 10000 : 2000);   // sin hash no hay contenedor que esperar
+            let _told = false;
+            for (;;) {
+                if (Date.now() >= _quiet) {
+                    const _load = await bootLoad();
+                    if (!_load.pending.length) return null;
+                    if (Date.now() - _t0 >= BOOT_CEILING_MS)
+                        return `la app no terminó de llegar en ${BOOT_CEILING_MS / 1000} s (${describeBootLoad(_load)})`;
+                    if (!_told) { _told = true; console.log(`  ┃  ┃  ┃  ⏳ La app aún no aparece, pero sigue llegando (${describeBootLoad(_load)}); se espera hasta ${BOOT_CEILING_MS / 1000} s.`); }
+                }
                 const s = await page.evaluate((tgt) => {
                     const vis = (el) => { const r = el && el.getBoundingClientRect(); return !!(r && r.width > 0 && r.height > 0); };
                     if (Array.from(document.querySelectorAll('[id$="--errorPage"]')).some(vis)) return 'errorPage';
@@ -1174,7 +1254,6 @@ async function _execute(script, options) {
                 if (errs.length) return `excepción no capturada: ${(errs[0].message || '').split('\n')[0]}`;
                 await page.waitForTimeout(500);
             }
-            return null;
         }
         async function arriveAtApp(appLink, steps) {
             const _errs = [];
@@ -1184,11 +1263,11 @@ async function _execute(script, options) {
                 await arriveAtAppOnce(appLink, steps, false);
                 const _crash = await watchAppStart(appLink, _errs);
                 if (!_crash) return;
-                console.log(`  ┃  ┃  ┃  💥 La app se cayó al arrancar (${_crash}).`);
+                console.log(`  ┃  ┃  ┃  💥 La app no arrancó (${_crash}).`);
                 _errs.length = 0;
                 await arriveAtAppOnce(appLink, steps, true);
                 const _again = await watchAppStart(appLink, _errs);
-                if (_again) console.warn(`  ┃  ┃  ┃  ⚠️ La app volvió a caerse tras recargar (${_again}); se sigue y el paso dirá qué hay en pantalla.`);
+                if (_again) console.warn(`  ┃  ┃  ┃  ⚠️ La app tampoco arrancó tras recargar (${_again}); se sigue y el paso dirá qué hay en pantalla.`);
             } finally {
                 page.off('pageerror', _onErr);
             }
@@ -1740,11 +1819,16 @@ if (step.technology === 'WEBGUI') {
                         const _hash = await page.evaluate(() => location.hash).catch(() => '?');
                         console.log(`${T_SUB}🔬 DIAG B6: marco del paso = ${_stepFrame ? (_detached ? 'DESPRENDIDO — la pantalla se reemplazó bajo el paso' : 'vivo') : 'no había'}`
                             + ` · marco actual = ${_now ? _now.url().slice(0, 90) : 'ninguno'}${_other ? ' (es OTRO marco)' : ''}`
-                            + ` · hash = ${_hash}`);
+                            + ` · hash = ${_hash} · ${describeBootLoad(await bootLoad())}`);
                     } catch (e) { /* diagnóstico best-effort */ }
                 }
                 if (step.technology === 'UI5' && /Timeout/.test(stepErr.message || '')) {
-                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) vis++; } }); return { title, n, vis, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis} hash=${diag.hash}`); } catch (e) {}
+                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) vis++; } }); return { title, n, vis, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
+                }
+                // B15: el estado de carga viaja también en el error, para que MIMO vea si la app estaba
+                // ausente o todavía llegando sin tener que abrir el trace.
+                if (/Timeout/.test(stepErr.message || '')) {
+                    try { stepErr.message += ` · ${describeBootLoad(await bootLoad())}`; } catch (e) { /* best-effort */ }
                 }
                 throw stepErr;
             }
