@@ -81,3 +81,12 @@ de V4, alguna que no sea `GET`). El primero prueba la clasificación con los cue
 8b209885 (FORMS-0000005), cuyos listados cancelados por el buscador el bot daba por «escrituras sin
 confirmar». El segundo reproduce ese job con `runFiori` (listado cancelado + escritura con 201 → el
 intent termina bien) y comprueba que una escritura cancelada sigue haciendo fallar el intent (B10).
+
+## `boot-load.test.js` y `slow-boot-e2e.test.js` (este, en `npm run test:rpa`; tarda ~4 min)
+B15: una app que tarda en llegar no es una app ausente (job cbe25b0b: tras una recarga limpia el
+arranque de UI5 tardó diez veces lo normal y el paso falló con «sap.m.Button: total=0»). El primero
+prueba qué cuenta como fichero de arranque (`.js`, `.json`, `.properties`, nunca OData) y cómo se
+describe en los diagnósticos. El segundo usa `runFiori` contra un launchpad cuyo código llega tarde:
+espera a la app mientras siga bajando (hasta 120 s); si el `goto` de playwright-sap agota sus 30 s
+esperando a `load` con el documento ya ahí, sigue; si la app no llega nunca, recarga UNA vez y el paso
+falla con el estado de carga (`readyState`, ficheros pendientes, el más antiguo) en el mensaje y el DIAG.
