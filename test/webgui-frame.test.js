@@ -39,6 +39,7 @@ const srv = http.createServer((req, res) => {
         res.end(`<html><head><style>.lsBlockLayer{position:fixed;inset:0;background:rgba(0,0,0,.2)}</style></head><body>
             <div ct="B" lsdata='{"27":{"SID":"${TBAR}dbtnADD_TTMS","Type":"GuiDropDownButton"}}'>Add TTMs</div>
             <div class="lsBlockLayer" style="display:none"></div>
+            <div id="ur-loading" class="lsLoadARoot" style="position:absolute;display:none;visibility:hidden;z-index:20000"><div style="width:40px;height:40px">…</div></div>
             <script>
               // Imita la ida y vuelta al servidor de un campo "14":"SERVER": el overlay aparece
               // delay ms DESPUÉS de que el paso siguiente ya empezó, y dura dur.
@@ -47,6 +48,22 @@ const srv = http.createServer((req, res) => {
                   l.style.display = 'block';
                   setTimeout(() => { l.style.display = 'none'; }, dur);
               }, delay);
+              // B16: el indicador de carga de SAP, sin overlay propio, durante dur ms (-1: no se apaga).
+              window.sapLoading = (dur) => {
+                  const l = document.getElementById('ur-loading');
+                  l.style.display = 'block'; l.style.visibility = 'visible';
+                  if (dur >= 0) setTimeout(() => { l.style.display = 'none'; l.style.visibility = 'hidden'; }, dur);
+              };
+              // Dos popups con el fondo modal entre ellos (z-index del de arriba − 100), como el filtro
+              // del Content Manager en la corrida df7e6729.
+              window.popups = (on) => {
+                  document.querySelectorAll('.lsPWNew, #urPopupWindowBlockLayer').forEach((e) => e.remove());
+                  if (!on) return;
+                  document.body.insertAdjacentHTML('beforeend',
+                      '<div id="urPopupWindowBlockLayer" class="lsBlockLayer" style="display:block;z-index:10100"></div>'
+                    + '<div class="lsPWNew" style="position:fixed;top:10px;left:10px;width:200px;height:100px;z-index:10000">Filter</div>'
+                    + '<div class="lsPWNew" style="position:fixed;top:30px;left:30px;width:200px;height:100px;z-index:10200">Values</div>');
+              };
             </script></body></html>`);
     } else {
         res.end(`<html><body><iframe id="__container1-iframe" name="__container1-iframe" title="Application"
@@ -87,6 +104,21 @@ ok(waited > 1900, `esperó a que se fuera (${waited} ms): la histéresis cierra 
 await frame.evaluate(() => { document.querySelector('.lsBlockLayer').style.display = 'block'; });
 ok(await H.settleWebgui(frame, page) === false, 'overlay que no se va → false, sin lanzar (best-effort)');
 await frame.evaluate(() => { document.querySelector('.lsBlockLayer').style.display = 'none'; });
+
+console.log('== B16 · indicador de carga de SAP ==');
+ok(await H.webguiBusy(frame) === null, 'pantalla quieta → webguiBusy null');
+await frame.evaluate(() => window.popups(true));
+let t1 = Date.now();
+ok(await H.settleWebgui(frame, page) === true && Date.now() - t1 < 3000, 'popups abiertos con su fondo modal, sin carga → quieta enseguida (no regresa 700400c3)');
+await frame.evaluate(() => window.sapLoading(3000));
+ok(await H.webguiBusy(frame) === 'loading', 'con el indicador encendido → webguiBusy "loading" (el fondo modal sigue sin contar)');
+t1 = Date.now();
+ok(await H.settleWebgui(frame, page) === true && Date.now() - t1 > 2500, `indicador 3 s con popups → espera a que se apague (${Date.now() - t1} ms; antes: quieta al instante)`);
+await frame.evaluate(() => window.sapLoading(-1));
+t1 = Date.now();
+ok(await H.settleWebgui(frame, page, { busyCeilingMs: 2000 }) === false && Date.now() - t1 >= 2000, 'indicador que no se apaga → false al agotar su techo');
+ok(await H.settleWebgui(frame, page, { busyCeilingMs: 2000 }) === false, '… y el tope del indicador, no el de 20 s del overlay, es el que manda');
+await frame.evaluate(() => { const l = document.getElementById('ur-loading'); l.style.display = 'none'; l.style.visibility = 'hidden'; window.popups(false); });
 
 console.log('== B4 · carrera de candidatas ==');
 const candidatas = (sid) => {

@@ -110,34 +110,55 @@ function firstVisible(candidates, timeout) {
 // el tope entero (corrida 700400c3: 31 esperas de 20 s, 603 s de 1420). Sólo cuenta un overlay que
 // tape también al popup de arriba (z-index ≥ el suyo), o cualquiera si no hay popup.
 //
-// Best-effort: si se agota, avisa y sigue. Nunca lanza ni convierte un paso en un fallo.
+// B16: el overlay no es la única señal, ni la principal. La de SAP es su indicador de carga,
+// `#ur-loading` (`.lsLoadARoot`, z-index 20000): job df7e6729, tras el Enter del filtro del Content
+// Manager, la pantalla quedó con el indicador encendido y las dos ventanas del filtro abiertas más de
+// 40 s (a los 40 s, «Stop Application»), y la única `.lsBlockLayer` era el fondo modal, que no cuenta.
+// El bot dio la pantalla por quieta y falló con «Ventana de SAP abierta encima». En las idas y vueltas
+// lentas sin popup (Add de 4 s) el indicador también estaba encendido con el overlay apagado. Con el
+// indicador visible se espera hasta SAP_BUSY_CEILING_MS; con sólo el overlay, hasta SETTLE_TIMEOUT_MS.
+//
+// Best-effort: si se agota, devuelve false y no lanza; el paso decide (con SAP aún cargando, falla
+// diciéndolo; con sólo el overlay, avisa y sigue).
 // ============================================================
 const SETTLE_GRACE_MS    = 300;    // margen para que un overlay ya pedido llegue a aparecer
 const SETTLE_POLL_MS     = 200;    // separación entre lecturas
 const SETTLE_QUIET_POLLS = 3;      // lecturas limpias seguidas que se exigen
-const SETTLE_TIMEOUT_MS  = 20000;  // tope duro; al agotarse se sigue igualmente
+const SETTLE_TIMEOUT_MS  = 20000;  // tope con sólo el overlay; al agotarse se sigue igualmente
+const SAP_BUSY_CEILING_MS = 120000; // tope con el indicador de carga de SAP visible
+
+// ¿Está SAP ocupado en este marco? 'loading' (su indicador de carga), 'layer' (un overlay por encima
+// del popup de arriba) o null.
+function webguiBusyProbe() {
+    const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const on = (el) => { const cs = getComputedStyle(el); return cs.display !== 'none' && cs.visibility !== 'hidden'; };
+    if ([...document.querySelectorAll('#ur-loading, .lsLoadARoot')].some(on)) return 'loading';
+    const z = (el) => parseInt(getComputedStyle(el).zIndex, 10) || 0;
+    const topPopup = Math.max(-Infinity, ...[...document.querySelectorAll('.lsPWNew')].filter(shown).map(z));
+    return [...document.querySelectorAll('.lsBlockLayer')].some(el => shown(el) && z(el) >= topPopup) ? 'layer' : null;
+}
+async function webguiBusy(frame) {
+    return frame.evaluate(webguiBusyProbe).catch(() => null);
+}
 
 // Devuelve true si la pantalla quedó quieta, false si se agotó el tope, null si el marco
 // desapareció a mitad (desprendido o navegando: ya no hay nada que estabilizar ahí).
-async function settleWebgui(frame, page) {
-    const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+// `busyCeilingMs` existe para los tests; en producción vale SAP_BUSY_CEILING_MS.
+async function settleWebgui(frame, page, { busyCeilingMs = SAP_BUSY_CEILING_MS } = {}) {
+    const t0 = Date.now();
     await page.waitForTimeout(SETTLE_GRACE_MS);
     let quiet = 0;
-    while (Date.now() < deadline) {
+    for (;;) {
         let busy;
-        try {
-            busy = await frame.evaluate(() => {
-                const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-                const z = (el) => parseInt(getComputedStyle(el).zIndex, 10) || 0;
-                const topPopup = Math.max(-Infinity, ...[...document.querySelectorAll('.lsPWNew')].filter(shown).map(z));
-                return [...document.querySelectorAll('.lsBlockLayer')].some(el => shown(el) && z(el) >= topPopup);
-            });
-        } catch { return null; }
-        if (busy) quiet = 0;
-        else if (++quiet >= SETTLE_QUIET_POLLS) return true;
+        try { busy = await frame.evaluate(webguiBusyProbe); } catch { return null; }
+        if (!busy) {
+            if (++quiet >= SETTLE_QUIET_POLLS) return true;
+        } else {
+            quiet = 0;
+            if (Date.now() - t0 >= (busy === 'loading' ? busyCeilingMs : SETTLE_TIMEOUT_MS)) return false;
+        }
         await page.waitForTimeout(SETTLE_POLL_MS);
     }
-    return false;
 }
 
 // ============================================================
@@ -178,7 +199,7 @@ function sidLocator(scope, page, sid) {
 // estabilización y emparejamiento de SID, que es donde se han concentrado los tres últimos fallos
 // en producción. No forman parte de la API del módulo (runFiori) ni deben usarse desde el runner.
 export const __internals = { APP_DOC_URL, APP_IFRAME_CSS, appFrame, appScopes, firstVisible,
-                             settleWebgui, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup, isWriteRequest,
+                             settleWebgui, webguiBusy, sidWithoutAmp, sidVariants, sidLocator, runAggregatedGroup, isWriteRequest,
                              isBootResource, describeBootLoad };
 
 // Serialización: encadena ejecuciones para que solo corra una sesión de navegador a la vez.
@@ -592,6 +613,8 @@ async function _execute(script, options) {
     // B15: techo de la espera de arranque de una app mientras su código siga llegando. La opción
     // existe para los tests; en producción vale el valor por defecto.
     const BOOT_CEILING_MS = options.bootCeilingMs || 120000;
+    // B16: techo de espera con el indicador de carga de SAP WebGUI visible. Opción sólo para tests.
+    const webguiBusyCeilingMs = options.webguiBusyCeilingMs || SAP_BUSY_CEILING_MS;
     // Tiles KPI de Smart Business: bloqueadas por defecto (ver el page.route más abajo). Se cargan
     // con `blockKpiTiles: false` o MIMO_LOAD_KPI_TILES=1.
     const blockKpiTiles = options.blockKpiTiles !== undefined ? !!options.blockKpiTiles : process.env.MIMO_LOAD_KPI_TILES !== '1';
@@ -1312,7 +1335,11 @@ if (step.technology === 'WEBGUI') {
                 // servidor del paso anterior sigue en vuelo, actuar ahora deja la acción colgada.
                 _stepFrame = await appFrame(page);
                 if (_stepFrame) {
-                    const _settled = await settleWebgui(_stepFrame, page);
+                    const _settled = await settleWebgui(_stepFrame, page, { busyCeilingMs: webguiBusyCeilingMs });
+                    // B16: con el indicador de carga de SAP aún encendido, la pantalla no refleja todavía
+                    // la acción anterior; actuar sobre ella sería actuar sobre datos viejos.
+                    if (_settled === false && await webguiBusy(_stepFrame) === 'loading')
+                        throw new Error(`SAP WebGUI no terminó de procesar la acción anterior en ${webguiBusyCeilingMs / 1000} s (sigue con su indicador de carga): el paso no se ejecuta sobre una pantalla que SAP aún no ha actualizado.`);
                     if (_settled === false) console.log(`${T_SUB}⚠️ La pantalla WEBGUI sigue ocupada tras ${SETTLE_TIMEOUT_MS} ms (overlay .lsBlockLayer visible) — se actúa igualmente.`);
                     else if (_settled === null) console.log(`${T_SUB}⚠️ El marco de la app desapareció mientras se esperaba a que la pantalla se asentara.`);
                     // Con la pantalla ya asentada, un diálogo de transporte que haya abierto el paso
@@ -1340,7 +1367,12 @@ if (step.technology === 'WEBGUI') {
                     }, +_tgtWnd).catch(() => null);
                     let _pop = await _above();
                     for (let k = 0; _pop && k < 10; k++) { await page.waitForTimeout(500); _pop = await _above(); }
-                    if (_pop) throw new Error(`Ventana de SAP abierta encima (wnd[${_pop.wnd}]): el paso actúa sobre wnd[${_tgtWnd}], que no acepta acciones mientras siga abierta. Contenido: "${_pop.text}"`);
+                    if (_pop) {
+                        const _loading = await webguiBusy(_stepFrame) === 'loading';
+                        throw new Error(`Ventana de SAP abierta encima (wnd[${_pop.wnd}]): el paso actúa sobre wnd[${_tgtWnd}], que no acepta acciones mientras siga abierta.`
+                            + (_loading ? ' SAP WebGUI sigue procesando (indicador de carga visible): la ventana es la de la acción anterior, aún sin cerrar.' : '')
+                            + ` Contenido: "${_pop.text}"`);
+                    }
                 }
 
                 // Cada candidata se evalúa igual sobre el marco de la app y sobre la página; el
