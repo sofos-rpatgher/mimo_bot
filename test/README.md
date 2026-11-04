@@ -90,3 +90,12 @@ describe en los diagnósticos. El segundo usa `runFiori` contra un launchpad cuy
 espera a la app mientras siga bajando (hasta 120 s); si el `goto` de playwright-sap agota sus 30 s
 esperando a `load` con el documento ya ahí, sigue; si la app no llega nunca, recarga UNA vez y el paso
 falla con el estado de carga (`readyState`, ficheros pendientes, el más antiguo) en el mensaje y el DIAG.
+
+## `webgui-busy-e2e.test.js` (en `npm run test:rpa`) y la sección B16 de `webgui-frame.test.js`
+B16: la señal de que SAP WebGUI está ocupado es su indicador de carga (`#ur-loading`), no sólo el
+`.lsBlockLayer` (job df7e6729: con los popups del filtro abiertos, la única capa era el fondo modal y el
+bot dio por quieta una pantalla que SAP seguía procesando). `webgui-frame` prueba `settleWebgui` y
+`webguiBusy`: con popups y sin carga, quieta enseguida; con el indicador, espera a que se apague; si no
+se apaga, `false` al agotar su techo. El e2e reproduce el job con `runFiori`: si SAP tarda 8 s en el
+Enter del filtro, el paso siguiente espera y el clic llega a la fila; si no termina nunca, el paso
+falla diciendo que SAP no terminó de procesar, sin hacer clic sobre la pantalla vieja.
