@@ -99,3 +99,11 @@ bot dio por quieta una pantalla que SAP seguía procesando). `webgui-frame` prue
 se apaga, `false` al agotar su techo. El e2e reproduce el job con `runFiori`: si SAP tarda 8 s en el
 Enter del filtro, el paso siguiente espera y el clic llega a la fila; si no termina nunca, el paso
 falla diciendo que SAP no terminó de procesar, sin hacer clic sobre la pantalla vieja.
+
+## `ui5-busy-list-e2e.test.js` (en `npm run test:rpa`)
+B17: un control UI5 dentro de un contenedor ocupado (`getBusy()`) todavía no está listo para el paso
+(job e0b7365f: tras escribir la página en el buscador de «Manage Launchpad Pages», el bot clicó la
+primera fila de la lista aún sin filtrar, bajo el indicador de UI5; el clic se perdió y Edit no apareció).
+El e2e reproduce el buscador con una tabla que filtra 1,6 s. Si la tabla ocupada se traga el clic, antes
+fallaba por timeout; si el clic llega, antes abría la página equivocada (la del intent anterior, primera
+por fecha de cambio). Ahora espera a que la tabla termine y abre la página buscada en los dos casos.
