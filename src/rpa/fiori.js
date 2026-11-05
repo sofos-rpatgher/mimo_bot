@@ -1614,6 +1614,12 @@ if (step.technology === 'WEBGUI') {
                 console.log(`${T_SUB}🧩 UI5 Control: ${sel.controlType} | ⏳ Esperando renderizado...`);
 
                 // 🛠️ MEJORA 2: Polling Inteligente para esperar a que los Tiles/Controles existan
+                // B17: un control dentro de un contenedor ocupado (busy) no está listo. Job e0b7365f: el
+                // paso anterior escribió la página en el buscador de «Manage Launchpad Pages» y la tabla
+                // se puso a filtrar (1,6 s). Al segundo, la fila 1 visible era aún la de la lista sin
+                // filtrar —la página editada en el intent anterior, que va primera por fecha de cambio—
+                // y el bot la clicó bajo el indicador de UI5. El clic se perdió y Edit no apareció en
+                // 30 s; si hubiera llegado, habría abierto la página equivocada.
                 const _waitRender = (ms) => page.waitForFunction((sSel) => {
                     const sapObj = window.sap || window.top.sap;
                     if (!sapObj || !sapObj.ui) return false;
@@ -1621,6 +1627,18 @@ if (step.technology === 'WEBGUI') {
                     if (!hasGetCore && !(sapObj.ui.core && sapObj.ui.core.Element)) return false;
 
                     const core = hasGetCore ? sapObj.ui.getCore() : null;
+                    // B17: ¿el control o uno de sus contenedores está ocupado? Se sube por los padres
+                    // mientras su DOM contenga al del control (un diálogo no está dentro de la vista
+                    // que lo abre: una vista ocupada detrás no bloquea al diálogo).
+                    const busyUp = (el) => {
+                        const d0 = el.getDomRef && el.getDomRef();
+                        for (let c = el; c; c = c.getParent && c.getParent()) {
+                            const d = c.getDomRef && c.getDomRef();
+                            if (c !== el && (!d || !d.contains(d0))) break;
+                            if (typeof c.getBusy === 'function' && c.getBusy()) return true;
+                        }
+                        return false;
+                    };
 
                     // 1. Búsqueda por ID estático. Si el id existe Y está pintado → ok. Si NO (p.ej. id
                     // con clone volátil "-__cloneN" que cambia entre renders, o control aún sin DOM),
@@ -1629,7 +1647,7 @@ if (step.technology === 'WEBGUI') {
                     const byId = (core && sSel.id && !sSel.id.startsWith("__")) ? core.byId(sSel.id) : null;
                     if (byId) {
                         const d = byId.getDomRef && byId.getDomRef(); const r = d && d.getBoundingClientRect();
-                        if (r && r.width > 0 && r.height > 0) return true;
+                        if (r && r.width > 0 && r.height > 0 && !busyUp(byId)) return true;
                     }
 
                     // 2. Búsqueda dinámica en el registro de elementos
@@ -1655,7 +1673,7 @@ if (step.technology === 'WEBGUI') {
                                 }
                                 // Requerir que esté VISIBLE (renderizada) para que el paso de acción
                                 // encuentre el mismo control con DOM utilizable.
-                                if (isMatch) { const d = el.getDomRef && el.getDomRef(); if (d) { const r = d.getBoundingClientRect(); if (r.width > 0 && r.height > 0) isFound = true; } }
+                                if (isMatch) { const d = el.getDomRef && el.getDomRef(); if (d) { const r = d.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && !busyUp(el)) isFound = true; } }
                             }
                         });
                     }
@@ -1855,7 +1873,7 @@ if (step.technology === 'WEBGUI') {
                     } catch (e) { /* diagnóstico best-effort */ }
                 }
                 if (step.technology === 'UI5' && /Timeout/.test(stepErr.message || '')) {
-                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) vis++; } }); return { title, n, vis, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
+                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0, busy=0; const busyUp = (el) => { const d0 = el.getDomRef && el.getDomRef(); for (let c = el; c; c = c.getParent && c.getParent()) { const d = c.getDomRef && c.getDomRef(); if (c !== el && (!d || !d.contains(d0))) break; if (typeof c.getBusy === 'function' && c.getBusy()) return true; } return false; }; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) { vis++; if (busyUp(el)) busy++; } } }); return { title, n, vis, busy, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis}${diag.busy ? ` (${diag.busy} dentro de un contenedor ocupado: UI5 aún cargando)` : ''} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
                 }
                 // B15: el estado de carga viaja también en el error, para que MIMO vea si la app estaba
                 // ausente o todavía llegando sin tener que abrir el trace.
