@@ -1627,14 +1627,22 @@ if (step.technology === 'WEBGUI') {
                     if (!hasGetCore && !(sapObj.ui.core && sapObj.ui.core.Element)) return false;
 
                     const core = hasGetCore ? sapObj.ui.getCore() : null;
-                    // B17: ¿el control o uno de sus contenedores está ocupado? Se sube por los padres
-                    // mientras su DOM contenga al del control (un diálogo no está dentro de la vista
-                    // que lo abre: una vista ocupada detrás no bloquea al diálogo).
+                    // B17: ¿el control o uno de sus contenedores está ocupado? Sólo cuentan los padres
+                    // cuyo DOM contiene al del control: un diálogo no está dentro de la vista que lo
+                    // abre, y una vista ocupada detrás no lo bloquea.
+                    // B18: un padre que no lo contiene se SALTA, no corta la subida. Job 7ac95023: el
+                    // camino al «···» de la barra de tiles pasa por la pestaña «Page Content»
+                    // (IconTabFilter), cuyo DOM es sólo su cabecera; la subida se cortaba ahí y no
+                    // llegaba a la vista, ocupada tras pulsar Edit. Además se mira el DOM (la clase
+                    // y el aria-busy que UI5 pone al pintar el indicador) y el indicador global.
                     const busyUp = (el) => {
                         const d0 = el.getDomRef && el.getDomRef();
+                        if (d0 && d0.closest && d0.closest('.sapUiLocalBusy, [aria-busy="true"]')) return true;
+                        const g = document.getElementById('sapUiBusyIndicator');
+                        if (g) { const r = g.getBoundingClientRect(), cs = getComputedStyle(g);
+                                 if (r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden') return true; }
                         for (let c = el; c; c = c.getParent && c.getParent()) {
-                            const d = c.getDomRef && c.getDomRef();
-                            if (c !== el && (!d || !d.contains(d0))) break;
+                            if (c !== el) { const d = c.getDomRef && c.getDomRef(); if (!d || !d0 || !d.contains(d0)) continue; }
                             if (typeof c.getBusy === 'function' && c.getBusy()) return true;
                         }
                         return false;
@@ -1833,7 +1841,24 @@ if (step.technology === 'WEBGUI') {
                     // Por id cuando lo hay (Playwright lo vuelve a resolver tras un repintado); el
                     // atributo marcado queda solo para nodos sin id.
                     const _clickLoc = _outcome.domId ? page.locator(`id=${_outcome.domId}`) : page.locator('[data-fiori-click="1"]');
-                    await _clickLoc.first().click({ force: true });
+                    // B18: si UI5 repinta el control durante el clic (Playwright: «detached … retrying»
+                    // y luego «Element is not visible»), se espera otra vez a que esté listo y se
+                    // reintenta una vez. Un nodo sin id pierde su marca al repintarse: no hay reintento.
+                    try {
+                        await _clickLoc.first().click({ force: true });
+                    } catch (clickErr) {
+                        const _m = (clickErr.message || '').split('\n')[0];
+                        if (!/not visible|detached|not attached|outside of the viewport/i.test(clickErr.message || '')) throw clickErr;
+                        const _repaint = `el control ${sel.controlType} se repintó durante el clic (UI5 seguía montando la pantalla)`;
+                        if (!_outcome.domId) throw new Error(`${_repaint}: ${_m}`);
+                        console.log(`${T_SUB}🔁 ${_repaint}; se espera a que esté listo y se reintenta.`);
+                        try {
+                            await _waitRender(15000);
+                            await _clickLoc.first().click({ force: true, timeout: 15000 });
+                        } catch (e2) {
+                            throw new Error(`${_repaint} y tras esperar sigue sin poder pulsarse: ${(e2.message || '').split('\n')[0]} (primer intento: ${_m})`);
+                        }
+                    }
                     // B9: un botón que abre menú (aria-haspopup) puede abrirlo y verlo cerrarse solo si la
                     // vista todavía se está asentando. Job 53ba0fa1: el «⋯» del selector de tiles abrió su
                     // popover a los 314,3 s y a los 314,4 s ya estaba cerrado (aria-expanded="false"), justo
@@ -1873,7 +1898,7 @@ if (step.technology === 'WEBGUI') {
                     } catch (e) { /* diagnóstico best-effort */ }
                 }
                 if (step.technology === 'UI5' && /Timeout/.test(stepErr.message || '')) {
-                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0, busy=0; const busyUp = (el) => { const d0 = el.getDomRef && el.getDomRef(); for (let c = el; c; c = c.getParent && c.getParent()) { const d = c.getDomRef && c.getDomRef(); if (c !== el && (!d || !d.contains(d0))) break; if (typeof c.getBusy === 'function' && c.getBusy()) return true; } return false; }; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) { vis++; if (busyUp(el)) busy++; } } }); return { title, n, vis, busy, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis}${diag.busy ? ` (${diag.busy} dentro de un contenedor ocupado: UI5 aún cargando)` : ''} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
+                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0, busy=0; const busyUp = (el) => { const d0 = el.getDomRef && el.getDomRef(); if (d0 && d0.closest && d0.closest('.sapUiLocalBusy, [aria-busy="true"]')) return true; const g = document.getElementById('sapUiBusyIndicator'); if (g) { const r = g.getBoundingClientRect(), cs = getComputedStyle(g); if (r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden') return true; } for (let c = el; c; c = c.getParent && c.getParent()) { if (c !== el) { const d = c.getDomRef && c.getDomRef(); if (!d || !d0 || !d.contains(d0)) continue; } if (typeof c.getBusy === 'function' && c.getBusy()) return true; } return false; }; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) { vis++; if (busyUp(el)) busy++; } } }); return { title, n, vis, busy, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis}${diag.busy ? ` (${diag.busy} dentro de un contenedor ocupado: UI5 aún cargando)` : ''} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
                 }
                 // B15: el estado de carga viaja también en el error, para que MIMO vea si la app estaba
                 // ausente o todavía llegando sin tener que abrir el trace.
