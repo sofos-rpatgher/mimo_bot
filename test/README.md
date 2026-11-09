@@ -107,3 +107,12 @@ primera fila de la lista aún sin filtrar, bajo el indicador de UI5; el clic se 
 El e2e reproduce el buscador con una tabla que filtra 1,6 s. Si la tabla ocupada se traga el clic, antes
 fallaba por timeout; si el clic llega, antes abría la página equivocada (la del intent anterior, primera
 por fecha de cambio). Ahora espera a que la tabla termine y abre la página buscada en los dos casos.
+
+## `ui5-busy-view-e2e.test.js` (en `npm run test:rpa`)
+B18: dos huecos de B17 (job 7ac95023, «Element is not visible» en el «···» de la barra de tiles tras Edit).
+La subida por los padres se cortaba en la pestaña «Page Content» (un `IconTabFilter`, cuyo DOM es sólo
+su cabecera) y no llegaba a la vista ocupada; ahora un padre que no contiene al control se salta, y además
+se mira el DOM (`sapUiLocalBusy`/`aria-busy`) y el indicador global de UI5. Y si UI5 repinta el control
+durante el clic, se espera a que vuelva a estar listo y se reintenta una vez. El e2e reproduce las dos
+cosas (antes: clic perdido; «Element is not visible») y comprueba que un diálogo abierto sobre una vista
+ocupada no se queda esperando a la vista.
