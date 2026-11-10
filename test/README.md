@@ -132,3 +132,16 @@ SAP acaba de abrir) y después las de debajo. Si alguna dice «already exists» 
 al momento con ese texto y qué hacer (la tanda no es idempotente: borrar en SAP antes de relanzar). Job
 41beb341: el catálogo ya existía, SAP lo dijo en wnd[2] y el error citó wnd[1] «Create Catalog». El e2e
 reproduce las dos ventanas apiladas.
+
+## `write-rejected-e2e.test.js` (en `npm run test:rpa`)
+B21: si SAP rechaza una escritura (HTTP ≥ 400, o un changeset rechazado dentro de un $batch), el intent
+falla al empezar el paso siguiente con el mensaje del servidor; si el rechazo llega mientras ese paso
+espera y el paso falla, el error lleva el rechazo delante como causa. Antes sólo se comprobaba al cerrar
+el intent (job 6ee54fd1: «Create» de una página que ya existía → POST pageSet 400 «Exists already»; el
+paso siguiente esperó 30 s un «Edit» imposible y el error fue ese timeout). El e2e reproduce los dos casos.
+
+## `webgui-maxlength-e2e.test.js` (en `npm run test:rpa`)
+B22: antes de escribir en un campo WEBGUI (o WebDynpro) se mira su `maxlength`; si el valor no cabe, el
+paso falla sin escribir, diciendo cómo quedaría recortado. Job ad52a241: el ID del catálogo de 36
+caracteres entró en un campo de 35 y el catálogo se creó como «…_CATALO», sin aviso. El e2e reproduce el
+caso (36: no se crea nada) y el límite exacto (35: se escribe completo).
