@@ -447,6 +447,18 @@ const WEBGUI_OPTIONAL_TIMEOUT_MS = 3000;
 // de un diálogo que llega tras la ida y vuelta del paso anterior lo cubre la segunda llamada, que
 // la rama WEBGUI hace ya con la pantalla asentada.
 // ============================================================
+// B22: un <input maxlength> recorta en silencio lo que se escribe. Job ad52a241: el ID del catálogo
+// «Z_BR_AA_SAP_BR_AA_ACCOUNTANT_CATALOG» (36) entró en un campo de 35 como «…_CATALO», el catálogo se
+// creó con ese nombre y 50 minutos después no se encontró. Se comprueba ANTES de escribir, para no
+// crear nada con el valor recortado. (No se compara el valor después: SAP pasa IDs a mayúsculas y
+// formatea fechas y números.)
+async function assertFitsMaxLength(loc, value, what) {
+    const max = await loc.evaluate((el) => (typeof el.maxLength === 'number' ? el.maxLength : -1)).catch(() => -1);
+    const v = String(value ?? '');
+    if (max > 0 && v.length > max)
+        throw new Error(`El campo ${what} admite ${max} caracteres y el valor «${v}» tiene ${v.length}: se quedaría como «${v.slice(0, max)}». El paso no se ejecuta; hay que acortar el valor en la tanda.`);
+}
+
 async function handleTransportDialog(page) {
     const scopes = await appScopes(page);
     for (const scope of scopes) {
@@ -1334,6 +1346,15 @@ async function _execute(script, options) {
                 message: _trace,
             });
 
+            // B21: si SAP ya rechazó una escritura de un paso anterior, el intent falla aquí con lo que
+            // contestó el servidor. Job 6ee54fd1: «Create» de una página que ya existía → POST pageSet
+            // HTTP 400 «Exists already»; settleWrites sólo lo habría dicho al cerrar el intent, pero
+            // antes el paso siguiente esperó 30 s un «Edit» imposible y el error fue ese timeout.
+            if (_writeErrors.length) {
+                const errs = _writeErrors.splice(0);
+                throw new Error(`SAP rechazó ${errs.length} escritura(s) de un paso anterior: ${errs.join(' · ').replace(/\.$/, '')}. El paso ${i + 1} no se ejecuta.`);
+            }
+
             // Despachar diálogo de transporte si quedó abierto por una acción previa.
             await handleTransportDialog(page);
 
@@ -1515,6 +1536,7 @@ if (step.technology === 'WEBGUI') {
                                              .locator('input, textarea, [contenteditable]').first();
                         }
                     }
+                    await assertFitsMaxLength(fillLoc, step.value, step.sid);
                     await fillLoc.fill(step.value);
                 } else if (step.action === 'check') {
                     await locator.check();
@@ -1627,6 +1649,7 @@ if (step.technology === 'WEBGUI') {
                     await matched.loc.hover({ force: true });
                     await page.waitForTimeout(500);
                 } else if (step.action === 'fill') {
+                    await assertFitsMaxLength(matched.loc, step.value, sel.labelText || sel.name || sel.text || sel.ct);
                     await matched.loc.fill(step.value);
                 } else if (step.action === 'check') {
                     await matched.loc.check();
@@ -1977,6 +2000,12 @@ if (step.technology === 'WEBGUI') {
                 // ausente o todavía llegando sin tener que abrir el trace.
                 if (/Timeout/.test(stepErr.message || '')) {
                     try { stepErr.message += ` · ${describeBootLoad(await bootLoad())}`; } catch (e) { /* best-effort */ }
+                }
+                // B21: si mientras tanto SAP rechazó una escritura (p.ej. la del paso anterior, cuya
+                // respuesta llegó durante la espera de éste), ésa es la causa: va delante.
+                if (_writeErrors.length) {
+                    const errs = _writeErrors.splice(0);
+                    stepErr.message = `SAP rechazó ${errs.length} escritura(s): ${errs.join(' · ')} — por eso, probablemente, el paso ${i + 1} falló: ${stepErr.message}`;
                 }
                 throw stepErr;
             }
