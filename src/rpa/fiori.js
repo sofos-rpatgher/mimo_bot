@@ -1297,9 +1297,22 @@ async function _execute(script, options) {
         }
         async function runStepList(steps) {
         let _menuOpener = null;   // B13: control que el paso anterior usó para abrir un menú
+        let _searchedFor = null;  // B19: lo que el paso anterior escribió en un buscador
         for (let i = 0; i < steps.length; i++) {
             const step = steps[i];
             const _opener = _menuOpener; _menuOpener = null;
+            // B19: el clic que sigue a una búsqueda va a una FILA de resultados, y sólo vale la fila
+            // que se llama exactamente como lo buscado. Job 7ac95023: los buscadores de SAP buscan
+            // por «contiene», ordenados a su manera, y MIMO graba «la primera fila». Buscar
+            // «Operational Supplier Evaluation» dio primero «Adjust Operational Supplier Evaluation
+            // Score»; «Purchasing Spend», primero «Contract Leakage» (por su subtítulo); «Supplier
+            // Evaluation By Quality», primero «… by Quality». Se añadieron esos tiles y los intents
+            // salieron bien. Es un paso de fila si el control es un elemento de lista o vive en una
+            // (id con «-__cloneN», como el «Add» de cada tile).
+            const _rowStep = step.technology === 'UI5' && /^(click|select|press)$/.test(step.action) && step.wdi5_selector
+                && (/ListItem$/.test(step.wdi5_selector.controlType || '') || /-__clone\d+/.test(step.wdi5_selector.id || ''));
+            const _exactFor = _rowStep ? _searchedFor : null;
+            _searchedFor = null;
             stepsDone++; // progreso por acción: cada paso procesado (incluidos los optional omitidos) cuenta
             if (current) { current.stepIndex = i + 1; current.action = step.action; current.sid = step.sid || (step.selector && step.selector.ct) || null; }
             console.log(`\n${T_STEP}⏳ [Paso ${i+1}/${steps.length}] Tecnología: ${step.technology} | Acción: ${step.action.toUpperCase()}`);
@@ -1620,6 +1633,7 @@ if (step.technology === 'WEBGUI') {
                 // filtrar —la página editada en el intent anterior, que va primera por fecha de cambio—
                 // y el bot la clicó bajo el indicador de UI5. El clic se perdió y Edit no apareció en
                 // 30 s; si hubiera llegado, habría abierto la página equivocada.
+                const _sSel = _exactFor ? { ...sel, _exact: _exactFor } : sel;
                 const _waitRender = (ms) => page.waitForFunction((sSel) => {
                     const sapObj = window.sap || window.top.sap;
                     if (!sapObj || !sapObj.ui) return false;
@@ -1648,6 +1662,22 @@ if (step.technology === 'WEBGUI') {
                         return false;
                     };
 
+                    // B19: 2 = la fila del control tiene un texto exactamente igual a lo buscado; 1 = igual
+                    // salvo mayúsculas; 0 = está en una fila que se llama de otra forma; -1 = no está en
+                    // una fila.
+                    const rowRank = (dom, v) => {
+                        const row = dom && dom.closest && dom.closest('.sapMLIB'); if (!row) return -1;
+                        let k = 0;
+                        for (const n of row.querySelectorAll('*')) {
+                            if (n.children.length) continue;
+                            const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
+                            if (t === v) return 2;
+                            if (t.toLowerCase() === v.toLowerCase()) k = 1;
+                        }
+                        return k;
+                    };
+                    const okRow = (dom) => !sSel._exact || rowRank(dom, sSel._exact) > 0;
+
                     // 1. Búsqueda por ID estático. Si el id existe Y está pintado → ok. Si NO (p.ej. id
                     // con clone volátil "-__cloneN" que cambia entre renders, o control aún sin DOM),
                     // NO abortar: seguir con la búsqueda por tipo+propiedades+visibilidad. Mismo
@@ -1655,7 +1685,7 @@ if (step.technology === 'WEBGUI') {
                     const byId = (core && sSel.id && !sSel.id.startsWith("__")) ? core.byId(sSel.id) : null;
                     if (byId) {
                         const d = byId.getDomRef && byId.getDomRef(); const r = d && d.getBoundingClientRect();
-                        if (r && r.width > 0 && r.height > 0 && !busyUp(byId)) return true;
+                        if (r && r.width > 0 && r.height > 0 && !busyUp(byId) && okRow(d)) return true;
                     }
 
                     // 2. Búsqueda dinámica en el registro de elementos
@@ -1681,13 +1711,23 @@ if (step.technology === 'WEBGUI') {
                                 }
                                 // Requerir que esté VISIBLE (renderizada) para que el paso de acción
                                 // encuentre el mismo control con DOM utilizable.
-                                if (isMatch) { const d = el.getDomRef && el.getDomRef(); if (d) { const r = d.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && !busyUp(el)) isFound = true; } }
+                                if (isMatch) { const d = el.getDomRef && el.getDomRef(); if (d) { const r = d.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && !busyUp(el) && okRow(d)) isFound = true; } }
                             }
                         });
                     }
                     return isFound;
-                }, sel, { polling: 500, timeout: ms });
-                await waitWithMenuReopen(_waitRender, _opener, step.optional ? optionalTimeoutMs : 30000, (m) => console.log(`${T_SUB}${m}`)); // pasos optional → timeout corto
+                }, _sSel, { polling: 500, timeout: ms });
+                try {
+                    await waitWithMenuReopen(_waitRender, _opener, step.optional ? optionalTimeoutMs : 30000, (m) => console.log(`${T_SUB}${m}`)); // pasos optional → timeout corto
+                } catch (waitErr) {
+                    if (!_exactFor || !/Timeout/.test(waitErr.message || '')) throw waitErr;
+                    // B19: decir qué filas había, para ver si el nombre no existe o se llama distinto.
+                    const _rows = await page.evaluate(() => [...document.querySelectorAll('.sapMLIB')]
+                        .filter((r) => { const b = r.getBoundingClientRect(); return b.width > 0 && b.height > 0; })
+                        .map((r) => { const l = [...r.querySelectorAll('*')].find((n) => !n.children.length && (n.textContent || '').trim()); return l ? l.textContent.trim() : ''; })
+                        .filter(Boolean).slice(0, 8)).catch(() => []);
+                    throw new Error(`Tras buscar «${_exactFor}», ninguna fila de resultados se llama exactamente así (filas visibles: ${_rows.length ? _rows.map((t) => `«${t}»`).join(', ') : 'ninguna'}). El paso no se ejecuta para no actuar sobre otra fila. (${(waitErr.message || '').split('\n')[0]})`);
+                }
 
                 // Para un FILL sobre ComboBox/Select: esperar a que carguen los ITEMS (OData async)
                 // antes de casar el valor. Si no, getItems() está vacío → no hay match → el key no se
@@ -1727,19 +1767,34 @@ if (step.technology === 'WEBGUI') {
                     const sapObj = window.sap || window.top.sap;
                     const core = typeof sapObj.ui.getCore === 'function' ? sapObj.ui.getCore() : null;
                     const isFill = (sAction === 'fill' || sAction === 'change' || sAction === 'enterText');
+                    // B19: 2 = la fila del control tiene un texto exactamente igual a lo buscado; 1 = igual
+                    // salvo mayúsculas; 0 = está en una fila que se llama de otra forma; -1 = no está en
+                    // una fila.
+                    const rowRank = (dom, v) => {
+                        const row = dom && dom.closest && dom.closest('.sapMLIB'); if (!row) return -1;
+                        let k = 0;
+                        for (const n of row.querySelectorAll('*')) {
+                            if (n.children.length) continue;
+                            const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
+                            if (t === v) return 2;
+                            if (t.toLowerCase() === v.toLowerCase()) k = 1;
+                        }
+                        return k;
+                    };
+                    const okRow = (dom) => !sSel._exact || rowRank(dom, sSel._exact) > 0;
                     const findControl = (s) => {
                         // Por id solo si está pintado; si no, se busca uno visible en el registro y el
                         // de id queda como último recurso (fill por setValue no necesita DOM).
                         const byId = (core && s.id && !s.id.startsWith("__")) ? core.byId(s.id) : null;
                         if (byId) {
                             const d = byId.getDomRef && byId.getDomRef(); const r = d && d.getBoundingClientRect();
-                            if (r && r.width > 0 && r.height > 0) return byId;
+                            if (r && r.width > 0 && r.height > 0 && okRow(d)) return byId;
                         }
                         // Preferir la coincidencia VISIBLE (con DOM renderizado): p.ej. hay varios
                         // botones "Add Section"/"Add" y solo uno está visible; los ocultos/plantilla no
                         // sirven. Para FILL, preferir además el input con valor VACÍO — así el título
                         // de la NUEVA sección se escribe en su campo (vacío), no renombra otra sección.
-                        let found = null, foundVisible = null, foundEnabled = null, foundEmpty = null;
+                        let found = null, foundVisible = null, foundEnabled = null, foundEmpty = null, foundExact = null;
                         sapObj.ui.core.Element.registry.forEach(el => {
                             if (foundEmpty) return;
                             const isType = el.getMetadata().getName() === s.controlType;
@@ -1759,8 +1814,9 @@ if (step.technology === 'WEBGUI') {
                                 if (!found) found = el;
                                 const dom = el.getDomRef && el.getDomRef();
                                 const r = dom && dom.getBoundingClientRect();
-                                const vis = r && r.width > 0 && r.height > 0;
+                                const vis = r && r.width > 0 && r.height > 0 && okRow(dom);
                                 if (vis) {
+                                    if (s._exact && !foundExact && rowRank(dom, s._exact) === 2) foundExact = el;
                                     if (!foundVisible) foundVisible = el;
                                     // Preferir ENABLED: desambigua p.ej. el "Add" del tile (habilitado)
                                     // frente al "Add" de la barra (deshabilitado si no hay tile marcado).
@@ -1770,6 +1826,8 @@ if (step.technology === 'WEBGUI') {
                                 }
                             }
                         });
+                        // B19: tras una búsqueda, sólo una fila con el nombre exacto; si no hay, ninguna.
+                        if (s._exact) return foundExact || foundEnabled || foundVisible;
                         return foundEmpty || foundEnabled || foundVisible || byId || found;
                     };
                     let oControl = findControl(sSel);
@@ -1824,7 +1882,7 @@ if (step.technology === 'WEBGUI') {
                             if (typeof oControl.fireSearch === 'function') oControl.fireSearch({ query: sValue, clearButtonPressed: false });
                         }
                         if (core) core.applyChanges();
-                        return { ok: true, click: false };
+                        return { ok: true, click: false, search: typeof oControl.fireSearch === 'function' };
                     }
                     // click / select / press → marcar el nodo DOM del control para un clic real
                     const dom = (oControl.getFocusDomRef && oControl.getFocusDomRef()) || (oControl.getDomRef && oControl.getDomRef());
@@ -1834,8 +1892,11 @@ if (step.technology === 'WEBGUI') {
                     // el nodo nuevo ya no lleva el atributo, pero sí conserva el id.
                     const _pop = dom.getAttribute('aria-haspopup');
                     return { ok: true, click: true, domId: dom.id || null, popup: !!_pop && _pop !== 'false' };
-                }, { sAction: step.action, sSel: sel, sValue: step.value });
-                if (!_outcome || !_outcome.ok) throw new Error(`Control UI5[${sel.controlType}] desapareció o no tiene DOM.`);
+                }, { sAction: step.action, sSel: _sSel, sValue: step.value });
+                if (!_outcome || !_outcome.ok) throw new Error(_exactFor
+                    ? `Tras buscar «${_exactFor}», la fila con ese nombre exacto dejó de estar en pantalla al ir a pulsarla (UI5[${sel.controlType}]).`
+                    : `Control UI5[${sel.controlType}] desapareció o no tiene DOM.`);
+                if (_outcome.search && step.value) _searchedFor = String(step.value);
                 if (_outcome.comboNoMatch) console.warn(`${T_SUB}⚠️ ComboBox: el valor "${_outcome.comboNoMatch.value}" NO coincide con ningún item — keys disponibles: ${JSON.stringify(_outcome.comboNoMatch.keys)}. El campo quedará vacío (revisa el key inyectado o si el runner tiene el fix de ComboBox).`);
                 if (_outcome.click) {
                     // Por id cuando lo hay (Playwright lo vuelve a resolver tras un repintado); el
