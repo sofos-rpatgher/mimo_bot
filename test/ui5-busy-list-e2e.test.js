@@ -48,7 +48,7 @@ const LAUNCHPAD = `<!doctype html><html><body>
     pages.forEach((p) => {
       const id = '${V}pagesColumnListItemPage-__clone' + (rowsN++);
       new Ctl(id, 'sap.m.ColumnListItem', { type: 'DetailAndActive' }, table);
-      t.insertAdjacentHTML('beforeend', '<div id="' + id + '" style="height:24px">' + p + '</div>');
+      t.insertAdjacentHTML('beforeend', '<div id="' + id + '" class="sapMLIB sapMListTblRow" style="height:24px"><span class="sapMText">' + p + '</span></div>');
       document.getElementById(id).addEventListener('click', () => {
         if (table.busy && block) return hit('lost');   // la tabla ocupada se traga el clic
         hit('open:' + p);

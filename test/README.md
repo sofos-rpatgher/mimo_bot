@@ -116,3 +116,12 @@ se mira el DOM (`sapUiLocalBusy`/`aria-busy`) y el indicador global de UI5. Y si
 durante el clic, se espera a que vuelva a estar listo y se reintenta una vez. El e2e reproduce las dos
 cosas (antes: clic perdido; «Element is not visible») y comprueba que un diálogo abierto sobre una vista
 ocupada no se queda esperando a la vista.
+
+## `ui5-search-exact-e2e.test.js` (en `npm run test:rpa`)
+B19: tras escribir en un buscador, el clic siguiente sobre una fila de resultados (un elemento de lista,
+o un control dentro de uno, como el «Add» de cada tile) sólo vale para la fila que se llama exactamente
+como lo buscado. Los buscadores de SAP buscan por «contiene» y MIMO graba «la primera fila» (job
+7ac95023: se añadieron «Adjust Operational Supplier Evaluation Score», «Contract Leakage» y «… by
+Quality» en lugar de los tiles pedidos, y los intents salieron bien). El e2e reproduce esos casos y el de
+páginas (`…_SOURCING` / `…_SOURCING_OVR`); si ninguna fila se llama así, el paso falla diciendo qué filas
+había, sin pulsar nada.
