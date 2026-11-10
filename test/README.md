@@ -125,3 +125,10 @@ como lo buscado. Los buscadores de SAP buscan por «contiene» y MIMO graba «la
 Quality» en lugar de los tiles pedidos, y los intents salieron bien). El e2e reproduce esos casos y el de
 páginas (`…_SOURCING` / `…_SOURCING_OVR`); si ninguna fila se llama así, el paso falla diciendo qué filas
 había, sin pulsar nada.
+
+## `webgui-popup-topmost-e2e.test.js` (en `npm run test:rpa`)
+B20: con varias ventanas de SAP abiertas encima de la del paso, el error cita la de más arriba (la que
+SAP acaba de abrir) y después las de debajo. Si alguna dice «already exists» / «ya existe», el paso falla
+al momento con ese texto y qué hacer (la tanda no es idempotente: borrar en SAP antes de relanzar). Job
+41beb341: el catálogo ya existía, SAP lo dijo en wnd[2] y el error citó wnd[1] «Create Catalog». El e2e
+reproduce las dos ventanas apiladas.

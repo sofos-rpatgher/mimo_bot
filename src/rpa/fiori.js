@@ -1366,25 +1366,37 @@ if (step.technology === 'WEBGUI') {
                 // (wnd[1]) con 2 errores de autorización; el Save y el Back sobre wnd[0] "funcionaron"
                 // sin hacer nada y el intent se reportó como completado sin haber guardado. Se espera
                 // un poco por si la ventana se está cerrando; si sigue, se falla con su contenido.
+                // Con varias abiertas se cita la de más arriba (número más alto), que es la que SAP
+                // acaba de abrir y la que explica el bloqueo, y luego las de debajo. Job 41beb341: al
+                // crear un catálogo que ya existía, SAP abrió wnd[2] «Information · Catalog '…' already
+                // exists» sobre wnd[1] «Create Catalog», y el error citó sólo wnd[1], la primera en el
+                // DOM. Un «already exists / ya existe» no se va a cerrar solo: se falla al momento.
                 const _tgtWnd = (String(step.sid || '').replace(/^split_arrow=/, '').match(/^wnd\[(\d+)\]/) || [])[1];
                 if (_tgtWnd != null && _stepFrame) {
                     const _above = () => _stepFrame.evaluate((n) => {
+                        const out = [];
                         for (const el of document.querySelectorAll('[lsdata*=\'"SID":"wnd[\']')) {
                             const m = (el.getAttribute('lsdata') || '').match(/"SID":"wnd\[(\d+)\]"/);
                             if (!m || +m[1] <= n) continue;
                             const r = el.getBoundingClientRect();
                             if (!(r.width > 0 && r.height > 0)) continue;
-                            return { wnd: +m[1], text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400) };
+                            out.push({ wnd: +m[1], text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400) });
                         }
-                        return null;
+                        return out.length ? out.sort((a, b) => b.wnd - a.wnd) : null;
                     }, +_tgtWnd).catch(() => null);
+                    const _exists = (pop) => pop && pop.some((w) => /already exists|ya existe/i.test(w.text));
                     let _pop = await _above();
-                    for (let k = 0; _pop && k < 10; k++) { await page.waitForTimeout(500); _pop = await _above(); }
+                    for (let k = 0; _pop && !_exists(_pop) && k < 10; k++) { await page.waitForTimeout(500); _pop = await _above(); }
                     if (_pop) {
+                        const _top = _pop[0], _rest = _pop.slice(1);
+                        const _under = _rest.length ? ` Debajo: ${_rest.map((w) => `wnd[${w.wnd}] "${w.text.slice(0, 120)}"`).join('; ')}.` : '';
+                        const _ex = _pop.find((w) => /already exists|ya existe/i.test(w.text));
+                        if (_ex) throw new Error(`SAP dice que el objeto ya existe (wnd[${_ex.wnd}]): "${_ex.text}". `
+                            + 'La tanda no es idempotente: hay que borrarlo en SAP (o quitarlo de la tanda) antes de relanzar.' + _under);
                         const _loading = await webguiBusy(_stepFrame) === 'loading';
-                        throw new Error(`Ventana de SAP abierta encima (wnd[${_pop.wnd}]): el paso actúa sobre wnd[${_tgtWnd}], que no acepta acciones mientras siga abierta.`
+                        throw new Error(`Ventana de SAP abierta encima (wnd[${_top.wnd}]): el paso actúa sobre wnd[${_tgtWnd}], que no acepta acciones mientras siga abierta.`
                             + (_loading ? ' SAP WebGUI sigue procesando (indicador de carga visible): la ventana es la de la acción anterior, aún sin cerrar.' : '')
-                            + ` Contenido: "${_pop.text}"`);
+                            + ` Contenido: "${_top.text}"` + _under);
                     }
                 }
 
