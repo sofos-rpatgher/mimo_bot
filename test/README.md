@@ -145,3 +145,11 @@ B22: antes de escribir en un campo WEBGUI (o WebDynpro) se mira su `maxlength`; 
 paso falla sin escribir, diciendo cómo quedaría recortado. Job ad52a241: el ID del catálogo de 36
 caracteres entró en un campo de 35 y el catálogo se creó como «…_CATALO», sin aviso. El e2e reproduce el
 caso (36: no se crea nada) y el límite exacto (35: se escribe completo).
+
+## `goto-late-document-e2e.test.js` (en `npm run test:rpa`)
+B23: si SAP tarda más de 30 s en devolver la página de la app, la navegación se sigue esperando hasta el
+techo de arranque (`BOOT_CEILING_MS`, 120 s). Antes la tolerancia de B15 sólo valía si el documento ya
+había llegado, y se medía con `page.url() !== 'about:blank'`, justo la URL que dejan las recargas limpias
+y el reintento (job b47044fb: el reintento murió con `page.goto: Timeout 30000ms` y url=about:blank).
+Ahora se mira si la navegación llegó (`framenavigated`). El e2e reproduce una página que llega a los 45 s
+(se ejecuta el paso) y una que no llega dentro del techo (falla diciendo que SAP no devolvió la página).

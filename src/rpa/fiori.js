@@ -979,14 +979,36 @@ async function _execute(script, options) {
         // un arranque lento rompía la navegación aunque el documento ya estuviera. Si el documento llegó
         // y su código sigue bajando, se sigue: la espera de SAPUI5 y watchAppStart deciden. Cualquier
         // otro fallo de navegación sigue siendo fallo.
+        //
+        // B23: «el documento llegó» se medía con `page.url() !== 'about:blank'`, pero las recargas
+        // limpias (y el reintento tras una caída) pasan antes por about:blank a propósito, y una
+        // navegación completa desde el launchpad conserva la URL anterior hasta que llega la respuesta.
+        // Job b47044fb: SAP tardó más de 30 s en devolver el launchpad al reintentar y el job murió con
+        // `page.goto: Timeout 30000ms` y url=about:blank. Ahora se mira si la navegación llegó
+        // (framenavigated del marco principal); si no, se le da hasta BOOT_CEILING_MS en total, como
+        // al arranque, y si ni así llega se dice eso.
         async function gotoApp(appLink) {
+            let _committed = false;
+            const _onNav = (f) => { if (f === page.mainFrame()) _committed = true; };
+            page.on('framenavigated', _onNav);
+            const _t0 = Date.now();
             try {
                 await page.goto(appLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
             } catch (e) {
-                if (!/Timeout/.test(e.message || '') || page.url() === 'about:blank') throw e;
+                if (!/Timeout/.test(e.message || '')) throw e;
+                if (!_committed) {
+                    console.log(`  ┃  ┃  ┃  ⏳ SAP no ha devuelto la página en 30 s; se le espera hasta ${BOOT_CEILING_MS / 1000} s.`);
+                    while (!_committed && Date.now() - _t0 < BOOT_CEILING_MS) await page.waitForTimeout(500);
+                    if (!_committed)
+                        throw new Error(`SAP no devolvió la página ${appLink} en ${BOOT_CEILING_MS / 1000} s: la navegación sigue sin respuesta del servidor (SAP o la red van lentos).`);
+                    console.log(`  ┃  ┃  ┃  ✅ La página llegó a los ${Math.round((Date.now() - _t0) / 1000)} s; se sigue esperando a SAPUI5.`);
+                    return;
+                }
                 const _load = await bootLoad();
                 if (!_load.pending.length) throw e;
                 console.log(`  ┃  ┃  ┃  ⏳ La página no terminó de cargar en 30 s, pero sigue llegando (${describeBootLoad(_load)}); se sigue esperando a SAPUI5.`);
+            } finally {
+                page.off('framenavigated', _onNav);
             }
         }
         async function arriveAtAppOnce(appLink, steps, forceReload) {
