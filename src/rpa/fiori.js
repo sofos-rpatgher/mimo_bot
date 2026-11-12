@@ -1705,10 +1705,13 @@ if (step.technology === 'WEBGUI') {
                     // camino al «···» de la barra de tiles pasa por la pestaña «Page Content»
                     // (IconTabFilter), cuyo DOM es sólo su cabecera; la subida se cortaba ahí y no
                     // llegaba a la vista, ocupada tras pulsar Edit. Además se mira el DOM (la clase
-                    // y el aria-busy que UI5 pone al pintar el indicador) y el indicador global.
+                    // que UI5 pone al pintar el indicador local) y el indicador global.
+                    // B24: sólo la clase, no aria-busy. Job e7535b43: la tabla de «Manage Launchpad
+                    // Pages» quita su indicador al terminar de filtrar pero se queda con
+                    // aria-busy="true" para siempre; la fila exacta se daba por ocupada 30 s.
                     const busyUp = (el) => {
                         const d0 = el.getDomRef && el.getDomRef();
-                        if (d0 && d0.closest && d0.closest('.sapUiLocalBusy, [aria-busy="true"]')) return true;
+                        if (d0 && d0.closest && d0.closest('.sapUiLocalBusy')) return true;
                         const g = document.getElementById('sapUiBusyIndicator');
                         if (g) { const r = g.getBoundingClientRect(), cs = getComputedStyle(g);
                                  if (r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden') return true; }
@@ -1779,10 +1782,19 @@ if (step.technology === 'WEBGUI') {
                 } catch (waitErr) {
                     if (!_exactFor || !/Timeout/.test(waitErr.message || '')) throw waitErr;
                     // B19: decir qué filas había, para ver si el nombre no existe o se llama distinto.
-                    const _rows = await page.evaluate(() => [...document.querySelectorAll('.sapMLIB')]
-                        .filter((r) => { const b = r.getBoundingClientRect(); return b.width > 0 && b.height > 0; })
-                        .map((r) => { const l = [...r.querySelectorAll('*')].find((n) => !n.children.length && (n.textContent || '').trim()); return l ? l.textContent.trim() : ''; })
-                        .filter(Boolean).slice(0, 8)).catch(() => []);
+                    // B24: si una fila visible SÍ se llama así, el problema no es el nombre (job
+                    // e7535b43: el mensaje decía «ninguna se llama así» enseñando la fila exacta).
+                    const _vis = await page.evaluate((v) => {
+                        const rows = [...document.querySelectorAll('.sapMLIB')].filter((r) => { const b = r.getBoundingClientRect(); return b.width > 0 && b.height > 0; });
+                        const leaves = (r) => [...r.querySelectorAll('*')].filter((n) => !n.children.length).map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+                        const exact = rows.find((r) => leaves(r).includes(v));
+                        const g = document.getElementById('sapUiBusyIndicator'); let gBusy = false;
+                        if (g) { const b = g.getBoundingClientRect(), cs = getComputedStyle(g); gBusy = b.width > 0 && b.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden'; }
+                        return { rows: rows.map((r) => leaves(r)[0] || '').filter(Boolean).slice(0, 8),
+                                 exact: !!exact, busy: !!(exact && (exact.closest('.sapUiLocalBusy') || gBusy)) };
+                    }, _exactFor).catch(() => ({ rows: [], exact: false, busy: false }));
+                    if (_vis.exact) throw new Error(`Tras buscar «${_exactFor}», la fila con ese nombre exacto está en pantalla, pero no se dio por lista en ${(step.optional ? optionalTimeoutMs : 30000) / 1000} s: ${_vis.busy ? 'UI5 sigue mostrando su indicador de carga sobre ella' : `el bot no la reconoce como ${sel.controlType} lista para pulsar`}. No es un problema del nombre ni de los datos de SAP. (${(waitErr.message || '').split('\n')[0]})`);
+                    const _rows = _vis.rows;
                     throw new Error(`Tras buscar «${_exactFor}», ninguna fila de resultados se llama exactamente así (filas visibles: ${_rows.length ? _rows.map((t) => `«${t}»`).join(', ') : 'ninguna'}). El paso no se ejecuta para no actuar sobre otra fila. (${(waitErr.message || '').split('\n')[0]})`);
                 }
 
@@ -2016,7 +2028,7 @@ if (step.technology === 'WEBGUI') {
                     } catch (e) { /* diagnóstico best-effort */ }
                 }
                 if (step.technology === 'UI5' && /Timeout/.test(stepErr.message || '')) {
-                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0, busy=0; const busyUp = (el) => { const d0 = el.getDomRef && el.getDomRef(); if (d0 && d0.closest && d0.closest('.sapUiLocalBusy, [aria-busy="true"]')) return true; const g = document.getElementById('sapUiBusyIndicator'); if (g) { const r = g.getBoundingClientRect(), cs = getComputedStyle(g); if (r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden') return true; } for (let c = el; c; c = c.getParent && c.getParent()) { if (c !== el) { const d = c.getDomRef && c.getDomRef(); if (!d || !d0 || !d.contains(d0)) continue; } if (typeof c.getBusy === 'function' && c.getBusy()) return true; } return false; }; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) { vis++; if (busyUp(el)) busy++; } } }); return { title, n, vis, busy, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis}${diag.busy ? ` (${diag.busy} dentro de un contenedor ocupado: UI5 aún cargando)` : ''} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
+                    try { const diag = await page.evaluate((ct) => { const sap = window.sap || window.top.sap; let title='', n=0, vis=0, busy=0; const busyUp = (el) => { const d0 = el.getDomRef && el.getDomRef(); if (d0 && d0.closest && d0.closest('.sapUiLocalBusy')) return true; const g = document.getElementById('sapUiBusyIndicator'); if (g) { const r = g.getBoundingClientRect(), cs = getComputedStyle(g); if (r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden') return true; } for (let c = el; c; c = c.getParent && c.getParent()) { if (c !== el) { const d = c.getDomRef && c.getDomRef(); if (!d || !d0 || !d.contains(d0)) continue; } if (typeof c.getBusy === 'function' && c.getBusy()) return true; } return false; }; sap.ui.core.Element.registry.forEach(el => { if (/customerTitle|customerCreatedTitle/.test(el.getId()) && el.getText) title = el.getText(); if (el.getMetadata().getName() === ct) { n++; const d=el.getDomRef&&el.getDomRef(); const r=d&&d.getBoundingClientRect(); if (r&&r.width>0&&r.height>0) { vis++; if (busyUp(el)) busy++; } } }); return { title, n, vis, busy, hash: location.hash }; }, step.wdi5_selector && step.wdi5_selector.controlType); console.log(`${T_SUB}🔬 DIAG timeout: título="${diag.title}" ${step.wdi5_selector && step.wdi5_selector.controlType}: total=${diag.n} visibles=${diag.vis}${diag.busy ? ` (${diag.busy} dentro de un contenedor ocupado: UI5 aún cargando)` : ''} hash=${diag.hash} · ${describeBootLoad(await bootLoad())}`); } catch (e) {}
                 }
                 // B15: el estado de carga viaja también en el error, para que MIMO vea si la app estaba
                 // ausente o todavía llegando sin tener que abrir el trace.
