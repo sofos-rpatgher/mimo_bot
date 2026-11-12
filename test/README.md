@@ -112,7 +112,7 @@ por fecha de cambio). Ahora espera a que la tabla termine y abre la página busc
 B18: dos huecos de B17 (job 7ac95023, «Element is not visible» en el «···» de la barra de tiles tras Edit).
 La subida por los padres se cortaba en la pestaña «Page Content» (un `IconTabFilter`, cuyo DOM es sólo
 su cabecera) y no llegaba a la vista ocupada; ahora un padre que no contiene al control se salta, y además
-se mira el DOM (`sapUiLocalBusy`/`aria-busy`) y el indicador global de UI5. Y si UI5 repinta el control
+se mira el DOM (la clase `sapUiLocalBusy`; desde B24, no `aria-busy`) y el indicador global de UI5. Y si UI5 repinta el control
 durante el clic, se espera a que vuelva a estar listo y se reintenta una vez. El e2e reproduce las dos
 cosas (antes: clic perdido; «Element is not visible») y comprueba que un diálogo abierto sobre una vista
 ocupada no se queda esperando a la vista.
@@ -153,3 +153,11 @@ había llegado, y se medía con `page.url() !== 'about:blank'`, justo la URL que
 y el reintento (job b47044fb: el reintento murió con `page.goto: Timeout 30000ms` y url=about:blank).
 Ahora se mira si la navegación llegó (`framenavigated`). El e2e reproduce una página que llega a los 45 s
 (se ejecuta el paso) y una que no llega dentro del techo (falla diciendo que SAP no devolvió la página).
+
+## `ui5-stale-aria-busy-e2e.test.js` (en `npm run test:rpa`)
+B24 (job e7535b43): la tabla de «Manage Launchpad Pages» quita su indicador de carga al terminar de filtrar,
+pero se queda con `aria-busy="true"`. El guardia de «ocupado» de B18 miraba ese atributo, daba la fila
+exacta por ocupada 30 s y el paso fallaba con «ninguna fila se llama exactamente así» enseñando la fila
+exacta. Ahora sólo cuenta la clase `sapUiLocalBusy` (el indicador pintado) y `getBusy()`. El e2e comprueba
+que la fila se pulsa, y que si la tabla sigue ocupada de verdad el error dice que la fila está y UI5 sigue
+cargando, sin culpar al nombre.
